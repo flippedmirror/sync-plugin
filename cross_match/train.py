@@ -5,7 +5,7 @@ Two training phases:
   Phase 2 (fine-tune): Unfreeze encoder with very low lr for final epochs.
 
 Usage:
-    python -m cross_match.train --data-dir data/cross_match --output-dir checkpoints/cross_match --device mps
+    python -m cross_match.train --data-dir data/cross_match_v2 --output-dir checkpoints/cross_match_v2 --device cuda
 """
 
 from __future__ import annotations
@@ -24,13 +24,11 @@ from cross_match.config import ModelConfig, TrainConfig
 from cross_match.dataset import CachedFeatureDataset, CrossMatchDataset
 from cross_match.model import CrossMatchModel
 
-
-# Reference screen sizes for pixel distance calculation
-REF_SCREEN = (1170, 2532)  # iOS target
+REF_SCREEN = (1170, 2532)
 
 
-def cache_features(model: CrossMatchModel, dataset: CrossMatchDataset, cache_dir: str, device: str):
-    """Precompute DINOv2 features for all images and save to disk."""
+def cache_features(model: CrossMatchModel, dataset: CrossMatchDataset, cache_dir: str, device: str, batch_size: int = 32):
+    """Precompute DINOv2 features for all images in batches (10-20x faster than one-by-one)."""
     from PIL import Image
     from torchvision import transforms
 
@@ -44,64 +42,68 @@ def cache_features(model: CrossMatchModel, dataset: CrossMatchDataset, cache_dir
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+    # Collect unique image paths that need caching
     seen = set()
-    image_paths = []
+    to_cache = []
     for sample in dataset.samples:
         for key, subdir in [("source_image_path", "source"), ("target_image_path", "target")]:
             path = sample[key]
             if path not in seen:
                 seen.add(path)
                 stem = os.path.splitext(os.path.basename(path))[0]
-                image_paths.append((path, os.path.join(cache_dir, subdir, f"{stem}.pt")))
+                cache_path = os.path.join(cache_dir, subdir, "{}.pt".format(stem))
+                if not os.path.exists(cache_path):
+                    to_cache.append((path, cache_path))
 
-    print(f"  Caching features for {len(image_paths)} unique images...")
+    total = len(to_cache)
+    if total == 0:
+        print("  Feature cache already complete.")
+        return
 
-    with torch.no_grad():
-        for i, (img_path, cache_path) in enumerate(image_paths):
-            if os.path.exists(cache_path):
-                continue
+    print("  Caching features for {} images (batch_size={})...".format(total, batch_size))
+    t0 = time.time()
+
+    # Process in batches
+    for batch_start in range(0, total, batch_size):
+        batch_items = to_cache[batch_start:batch_start + batch_size]
+        images = []
+        for img_path, _ in batch_items:
             img = Image.open(img_path).convert("RGB")
-            tensor = transform(img).unsqueeze(0).to(device)
-            features = model._encode_image(tensor)
-            torch.save(features.squeeze(0).cpu(), cache_path)
+            images.append(transform(img))
 
-            if (i + 1) % 50 == 0:
-                print(f"    Cached {i + 1}/{len(image_paths)}")
+        batch_tensor = torch.stack(images).to(device)
 
-    print(f"  Feature caching complete.")
+        with torch.no_grad():
+            batch_features = model._encode_image(batch_tensor)  # (B, N_patches, D)
+
+        for j, (_, cache_path) in enumerate(batch_items):
+            torch.save(batch_features[j].cpu(), cache_path)
+
+        done = min(batch_start + batch_size, total)
+        elapsed = time.time() - t0
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / rate if rate > 0 else 0
+        print("    Cached {}/{} ({:.0f} img/s, ETA {:.0f}s)".format(done, total, rate, eta))
+
+    print("  Feature caching complete in {:.0f}s".format(time.time() - t0))
 
 
-def compute_loss(
-    outputs: dict,
-    target_coords: torch.Tensor,
-    source_action: torch.Tensor,
-    coord_weight: float = 1.0,
-    action_weight: float = 0.1,
-) -> tuple[torch.Tensor, dict]:
-    """Combined coordinate regression + action classification loss."""
+def compute_loss(outputs, target_coords, source_action, coord_weight=1.0, action_weight=0.1):
     pred_coords = outputs["target_coords"]
     action_logits = outputs["action_logits"]
 
     is_scroll = (source_action == 1).float()
     coord_mask = torch.stack([
-        torch.ones_like(is_scroll),
-        torch.ones_like(is_scroll),
-        is_scroll,
-        is_scroll,
+        torch.ones_like(is_scroll), torch.ones_like(is_scroll),
+        is_scroll, is_scroll,
     ], dim=1)
 
     coord_loss_raw = nn.functional.smooth_l1_loss(pred_coords, target_coords, reduction="none")
     coord_loss = (coord_loss_raw * coord_mask).sum() / coord_mask.sum()
-
     action_loss = nn.functional.cross_entropy(action_logits, source_action)
-
     total = coord_weight * coord_loss + action_weight * action_loss
 
-    return total, {
-        "total": total.item(),
-        "coord": coord_loss.item(),
-        "action": action_loss.item(),
-    }
+    return total, {"total": total.item(), "coord": coord_loss.item(), "action": action_loss.item()}
 
 
 def train_epoch(model, loader, optimizer, device, config, use_cached=False):
@@ -109,42 +111,27 @@ def train_epoch(model, loader, optimizer, device, config, use_cached=False):
     if model.config.freeze_encoder:
         model.encoder.eval()
 
-    total_loss = 0.0
-    total_coord = 0.0
-    total_action = 0.0
-    n = 0
+    total_loss, total_coord, total_action, n = 0.0, 0.0, 0.0, 0
 
-    for batch_idx, batch in enumerate(loader):
+    for batch in loader:
         if use_cached:
-            src_feat = batch["source_features"].to(device)
-            tgt_feat = batch["target_features"].to(device)
+            src, tgt = batch["source_features"].to(device), batch["target_features"].to(device)
         else:
-            src_img = batch["source_image"].to(device)
-            tgt_img = batch["target_image"].to(device)
+            src, tgt = batch["source_image"].to(device), batch["target_image"].to(device)
 
         src_coords = batch["source_coords"].to(device)
         src_action = batch["source_action"].to(device)
         tgt_coords = batch["target_coords"].to(device)
 
-        if use_cached:
-            outputs = model.forward_cached(src_feat, src_coords, src_action, tgt_feat)
-        else:
-            outputs = model(src_img, src_coords, src_action, tgt_img)
-
-        loss, loss_dict = compute_loss(
-            outputs, tgt_coords, src_action,
-            config.coord_loss_weight, config.action_loss_weight,
-        )
+        outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
+        loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        total_loss += loss_dict["total"]
-        total_coord += loss_dict["coord"]
-        total_action += loss_dict["action"]
-        n += 1
+        total_loss += ld["total"]; total_coord += ld["coord"]; total_action += ld["action"]; n += 1
 
     return {"loss": total_loss / n, "coord_loss": total_coord / n, "action_loss": total_action / n}
 
@@ -152,128 +139,112 @@ def train_epoch(model, loader, optimizer, device, config, use_cached=False):
 @torch.no_grad()
 def eval_epoch(model, loader, device, config, use_cached=False):
     model.eval()
-    total_loss = 0.0
+    total_loss, n = 0.0, 0
     all_dists = []
-    action_correct = 0
-    action_total = 0
-    n = 0
+    action_correct, action_total = 0, 0
 
     for batch in loader:
         if use_cached:
-            src_feat = batch["source_features"].to(device)
-            tgt_feat = batch["target_features"].to(device)
+            src, tgt = batch["source_features"].to(device), batch["target_features"].to(device)
         else:
-            src_img = batch["source_image"].to(device)
-            tgt_img = batch["target_image"].to(device)
+            src, tgt = batch["source_image"].to(device), batch["target_image"].to(device)
 
         src_coords = batch["source_coords"].to(device)
         src_action = batch["source_action"].to(device)
         tgt_coords = batch["target_coords"].to(device)
 
-        if use_cached:
-            outputs = model.forward_cached(src_feat, src_coords, src_action, tgt_feat)
-        else:
-            outputs = model(src_img, src_coords, src_action, tgt_img)
+        outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
+        loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
+        total_loss += ld["total"]
 
-        loss, loss_dict = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
-        total_loss += loss_dict["total"]
-
-        # Per-sample normalized L2 distance (first 2 coords = primary point)
         pred = outputs["target_coords"]
         dists = torch.sqrt(((pred[:, :2] - tgt_coords[:, :2]) ** 2).sum(dim=1))
         all_dists.extend(dists.cpu().tolist())
 
-        # Action accuracy
         pred_action = outputs["action_logits"].argmax(dim=1)
         action_correct += (pred_action == src_action).sum().item()
         action_total += src_action.shape[0]
         n += 1
 
     if not all_dists:
-        return {"loss": 0, "coord_dist_norm": 0, "coord_dist_px": 0, "hit_20px": 0, "hit_50px": 0, "action_acc": 0}
+        return {"loss": 0, "coord_dist_norm": 0, "coord_dist_px_mean": 0, "coord_dist_px_median": 0,
+                "hit_20px": 0, "hit_50px": 0, "hit_100px": 0, "action_acc": 0}
 
-    # Convert normalized distances to pixel distances (using reference screen)
     diag = math.sqrt(REF_SCREEN[0] ** 2 + REF_SCREEN[1] ** 2)
     px_dists = [d * diag for d in all_dists]
-
     sorted_px = sorted(px_dists)
-    mean_px = sum(px_dists) / len(px_dists)
-    median_px = sorted_px[len(sorted_px) // 2]
-    hit_20 = sum(1 for d in px_dists if d <= 20) / len(px_dists)
-    hit_50 = sum(1 for d in px_dists if d <= 50) / len(px_dists)
-    hit_100 = sum(1 for d in px_dists if d <= 100) / len(px_dists)
 
     return {
         "loss": total_loss / n,
         "coord_dist_norm": sum(all_dists) / len(all_dists),
-        "coord_dist_px_mean": mean_px,
-        "coord_dist_px_median": median_px,
-        "hit_20px": hit_20,
-        "hit_50px": hit_50,
-        "hit_100px": hit_100,
+        "coord_dist_px_mean": sum(px_dists) / len(px_dists),
+        "coord_dist_px_median": sorted_px[len(sorted_px) // 2],
+        "hit_20px": sum(1 for d in px_dists if d <= 20) / len(px_dists),
+        "hit_50px": sum(1 for d in px_dists if d <= 50) / len(px_dists),
+        "hit_100px": sum(1 for d in px_dists if d <= 100) / len(px_dists),
         "action_acc": action_correct / action_total if action_total > 0 else 0.0,
     }
 
 
+def write_progress(path, epoch, total_epochs, phase, train_m, val_m, elapsed, total_time):
+    """Write a progress file that can be polled remotely."""
+    progress = {
+        "epoch": epoch, "total_epochs": total_epochs, "phase": phase,
+        "train_loss": train_m["loss"], "val_loss": val_m["loss"],
+        "val_px_mean": val_m["coord_dist_px_mean"], "val_px_median": val_m["coord_dist_px_median"],
+        "val_hit_20px": val_m["hit_20px"], "val_hit_50px": val_m["hit_50px"],
+        "val_hit_100px": val_m["hit_100px"], "val_action_acc": val_m["action_acc"],
+        "epoch_time": elapsed, "total_time": total_time,
+        "status": "training",
+    }
+    with open(path, "w") as f:
+        json.dump(progress, f)
+
+
 def main(args):
     config = TrainConfig(
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        device=args.device,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        cache_features=not args.no_cache,
-        finetune_epochs=args.finetune_epochs,
-        log_every=args.log_every,
+        data_dir=args.data_dir, output_dir=args.output_dir, device=args.device,
+        batch_size=args.batch_size, num_epochs=args.epochs,
+        cache_features=not args.no_cache, finetune_epochs=args.finetune_epochs, log_every=args.log_every,
     )
     model_config = ModelConfig()
-
     os.makedirs(config.output_dir, exist_ok=True)
     device = config.device
+    progress_path = os.path.join(config.output_dir, "progress.json")
 
-    print(f"Initializing CrossMatch model...")
+    print("Initializing CrossMatch model...")
     model = CrossMatchModel(model_config).to(device)
-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"  Total params: {total / 1e6:.1f}M | Trainable: {trainable / 1e6:.1f}M")
+    total_params = sum(p.numel() for p in model.parameters())
+    print("  Total params: {:.1f}M | Trainable: {:.1f}M".format(total_params / 1e6, trainable / 1e6))
 
-    # Dataset
     raw_dataset = CrossMatchDataset(config.data_dir, model_config.image_size)
-    print(f"  Total samples (actions): {len(raw_dataset)}")
+    print("  Total samples (actions): {}".format(len(raw_dataset)))
 
     use_cached = config.cache_features
     if use_cached:
-        cache_features(model, raw_dataset, config.cache_dir, device)
+        cache_features(model, raw_dataset, config.cache_dir, device, batch_size=64)
         dataset = CachedFeatureDataset(config.data_dir, config.cache_dir, model_config.image_size)
     else:
         dataset = raw_dataset
 
-    # Split 90/10
     n_val = max(1, int(len(dataset) * 0.1))
     n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val],
-                                       generator=torch.Generator().manual_seed(42))
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
 
-    # Use num_workers=0 on MPS to avoid fork issues
     nw = 0 if device == "mps" else config.num_workers
+    pin = device not in ("mps", "cpu")
 
-    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True,
-                              num_workers=nw, pin_memory=(device != "mps"))
-    val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False,
-                            num_workers=nw, pin_memory=(device != "mps"))
+    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, num_workers=nw, pin_memory=pin)
+    val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
 
-    # Also keep raw image loaders for fine-tune phase
     if use_cached:
-        raw_train, raw_val = random_split(raw_dataset, [n_train, n_val],
-                                           generator=torch.Generator().manual_seed(42))
-        raw_train_loader = DataLoader(raw_train, batch_size=config.batch_size, shuffle=True,
-                                      num_workers=nw, pin_memory=(device != "mps"))
-        raw_val_loader = DataLoader(raw_val, batch_size=config.batch_size, shuffle=False,
-                                    num_workers=nw, pin_memory=(device != "mps"))
+        raw_train, raw_val = random_split(raw_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+        raw_train_loader = DataLoader(raw_train, batch_size=config.batch_size, shuffle=True, num_workers=nw, pin_memory=pin)
+        raw_val_loader = DataLoader(raw_val, batch_size=config.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
 
-    print(f"  Train: {n_train} | Val: {n_val} | Device: {device}")
-    print(f"  Epochs: {config.num_epochs} (frozen: {config.num_epochs - config.finetune_epochs}, fine-tune: {config.finetune_epochs})")
+    print("  Train: {} | Val: {} | Device: {}".format(n_train, n_val, device))
+    print("  Epochs: {} (frozen: {}, fine-tune: {})".format(config.num_epochs, config.num_epochs - config.finetune_epochs, config.finetune_epochs))
     print()
 
     optimizer = torch.optim.AdamW(
@@ -289,7 +260,6 @@ def main(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Training history
     history = []
     best_val_loss = float("inf")
     training_start = time.time()
@@ -299,18 +269,14 @@ def main(args):
         is_finetune = epoch >= (config.num_epochs - config.finetune_epochs)
         cur_use_cached = use_cached
 
-        # Phase 2: unfreeze encoder
         if is_finetune and model_config.freeze_encoder:
             if epoch == config.num_epochs - config.finetune_epochs:
                 print("\n" + "=" * 60)
-                print("PHASE 2: Fine-tuning encoder (unfrozen, low lr)")
+                print("PHASE 2: Fine-tuning encoder")
                 print("=" * 60)
                 for param in model.encoder.parameters():
                     param.requires_grad = True
-                optimizer.add_param_group({
-                    "params": model.encoder.parameters(),
-                    "lr": config.finetune_lr,
-                })
+                optimizer.add_param_group({"params": model.encoder.parameters(), "lr": config.finetune_lr})
             cur_use_cached = False
             cur_train_loader = raw_train_loader if use_cached else train_loader
             cur_val_loader = raw_val_loader if use_cached else val_loader
@@ -323,81 +289,60 @@ def main(args):
         scheduler.step()
 
         elapsed = time.time() - t0
+        total_time = time.time() - training_start
         lr = optimizer.param_groups[0]["lr"]
         phase = "FT" if is_finetune else "FR"
 
         entry = {
-            "epoch": epoch + 1,
-            "phase": phase,
-            "lr": lr,
-            "train_loss": train_m["loss"],
-            "train_coord_loss": train_m["coord_loss"],
-            "train_action_loss": train_m["action_loss"],
+            "epoch": epoch + 1, "phase": phase, "lr": lr,
+            "train_loss": train_m["loss"], "train_coord_loss": train_m["coord_loss"],
             "val_loss": val_m["loss"],
-            "val_coord_dist_px_mean": val_m["coord_dist_px_mean"],
-            "val_coord_dist_px_median": val_m["coord_dist_px_median"],
-            "val_hit_20px": val_m["hit_20px"],
-            "val_hit_50px": val_m["hit_50px"],
-            "val_hit_100px": val_m["hit_100px"],
-            "val_action_acc": val_m["action_acc"],
-            "epoch_time": elapsed,
+            "val_px_mean": val_m["coord_dist_px_mean"], "val_px_median": val_m["coord_dist_px_median"],
+            "val_hit_20px": val_m["hit_20px"], "val_hit_50px": val_m["hit_50px"], "val_hit_100px": val_m["hit_100px"],
+            "val_action_acc": val_m["action_acc"], "epoch_time": elapsed,
         }
         history.append(entry)
 
-        print(f"[{phase}] Epoch {epoch+1:3d}/{config.num_epochs} ({elapsed:.1f}s) lr={lr:.2e} | "
-              f"train={train_m['loss']:.4f} val={val_m['loss']:.4f} | "
-              f"px_mean={val_m['coord_dist_px_mean']:.0f} px_med={val_m['coord_dist_px_median']:.0f} | "
-              f"@20={val_m['hit_20px']:.0%} @50={val_m['hit_50px']:.0%} @100={val_m['hit_100px']:.0%} | "
-              f"act={val_m['action_acc']:.0%}")
+        print("[{}] Epoch {:3d}/{} ({:.1f}s) lr={:.2e} | train={:.4f} val={:.4f} | "
+              "px_mean={:.0f} px_med={:.0f} | @20={:.0%} @50={:.0%} @100={:.0%} | act={:.0%}".format(
+            phase, epoch + 1, config.num_epochs, elapsed, lr,
+            train_m["loss"], val_m["loss"],
+            val_m["coord_dist_px_mean"], val_m["coord_dist_px_median"],
+            val_m["hit_20px"], val_m["hit_50px"], val_m["hit_100px"], val_m["action_acc"]))
 
-        # Save best
+        write_progress(progress_path, epoch + 1, config.num_epochs, phase, train_m, val_m, elapsed, total_time)
+
         if val_m["loss"] < best_val_loss:
             best_val_loss = val_m["loss"]
-            save_path = os.path.join(config.output_dir, "best.pt")
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "model_config": model_config,
-                "val_metrics": val_m,
-            }, save_path)
-            print(f"  --> New best model saved (val_loss={best_val_loss:.4f})")
+            torch.save({"epoch": epoch + 1, "model_state_dict": model.state_dict(),
+                         "model_config": model_config, "val_metrics": val_m},
+                        os.path.join(config.output_dir, "best.pt"))
+            print("  --> New best (val_loss={:.4f})".format(best_val_loss))
 
-        # Periodic checkpoint
         if (epoch + 1) % config.save_every_epoch == 0:
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "model_config": model_config,
-            }, os.path.join(config.output_dir, f"epoch_{epoch + 1}.pt"))
+            torch.save({"epoch": epoch + 1, "model_state_dict": model.state_dict(), "model_config": model_config},
+                        os.path.join(config.output_dir, "epoch_{}.pt".format(epoch + 1)))
 
     total_time = time.time() - training_start
 
-    # Save training log
     log = {
-        "config": {
-            "model_params_total": total,
-            "model_params_trainable": trainable,
-            "num_train": n_train,
-            "num_val": n_val,
-            "device": device,
-            "epochs": config.num_epochs,
-            "batch_size": config.batch_size,
-            "lr": config.lr,
-        },
-        "best_val_loss": best_val_loss,
-        "total_training_time_seconds": total_time,
-        "history": history,
+        "config": {"model_params_total": total_params, "model_params_trainable": trainable,
+                    "num_train": n_train, "num_val": n_val, "device": device,
+                    "epochs": config.num_epochs, "batch_size": config.batch_size, "lr": config.lr},
+        "best_val_loss": best_val_loss, "total_training_time_seconds": total_time, "history": history,
     }
-    log_path = os.path.join(config.output_dir, "training_log.json")
-    with open(log_path, "w") as f:
+    with open(os.path.join(config.output_dir, "training_log.json"), "w") as f:
         json.dump(log, f, indent=2)
 
-    print(f"\n{'='*60}")
-    print(f"Training complete in {total_time:.0f}s")
-    print(f"Best val_loss: {best_val_loss:.4f}")
-    print(f"Training log: {log_path}")
-    print(f"Best model:   {os.path.join(config.output_dir, 'best.pt')}")
-    print(f"{'='*60}")
+    # Mark progress as complete
+    with open(progress_path, "w") as f:
+        json.dump({"status": "complete", "epoch": config.num_epochs, "total_epochs": config.num_epochs,
+                    "best_val_loss": best_val_loss, "total_time": total_time}, f)
+
+    print("\n" + "=" * 60)
+    print("Training complete in {:.0f}s ({:.1f} min)".format(total_time, total_time / 60))
+    print("Best val_loss: {:.4f}".format(best_val_loss))
+    print("=" * 60)
 
 
 if __name__ == "__main__":
@@ -408,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--finetune-epochs", type=int, default=5)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--no-cache", action="store_true", help="Don't precompute encoder features")
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
     main(args)

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 
 
@@ -56,4 +57,8 @@ class TrainConfig:
 
     # Feature caching (precompute encoder features for faster training)
     cache_features: bool = True
-    cache_dir: str = "data/cross_match/feature_cache"
+    cache_dir: str = ""  # Derived from data_dir if empty
+
+    def __post_init__(self):
+        if not self.cache_dir:
+            self.cache_dir = os.path.join(self.data_dir, "feature_cache")
