@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>CrossMatch Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f8f9fa; color: #1a1a1a; }
+    .header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 16px 32px; }
+    .header h1 { font-size: 22px; font-weight: 600; }
+    .header p { color: #666; font-size: 14px; margin-top: 4px; }
+    #status { font-weight: 500; }
+    #status.loading { color: #e67e00; }
+    #status.ready { color: #0a8a0a; }
+    #status.error { color: #d32f2f; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .controls label { font-weight: 600; font-size: 14px; }
+    .controls select, .controls input[type="number"] { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+    .controls input[type="number"] { width: 80px; }
+    .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; }
+    .btn-primary { background: #0066ff; color: #fff; }
+    .btn-primary:disabled { background: #99c2ff; cursor: not-allowed; }
+    .btn-danger { background: #d32f2f; color: #fff; }
+    .panels { display: flex; gap: 24px; margin-top: 16px; }
+    .panel { flex: 1; background: #fff; border-radius: 12px; border: 1px solid #e0e0e0; overflow: hidden; }
+    .panel-header { padding: 12px 16px; background: #f5f5f5; border-bottom: 1px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center; }
+    .panel-header h3 { font-size: 15px; font-weight: 600; }
+    .panel-header .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #e8e8e8; color: #555; }
+    .canvas-wrap { position: relative; cursor: crosshair; }
+    .canvas-wrap canvas { display: block; width: 100%; }
+    .canvas-wrap .empty-state { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 14px; pointer-events: none; }
+    .panel-footer { padding: 12px 16px; border-top: 1px solid #e0e0e0; font-size: 13px; color: #666; }
+    .metrics { margin-top: 20px; }
+    .metrics h3 { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .metric-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 14px; text-align: center; }
+    .metric-card .value { font-size: 28px; font-weight: 700; color: #0066ff; }
+    .metric-card .label { font-size: 12px; color: #888; margin-top: 4px; }
+    .log-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; border: 1px solid #e0e0e0; }
+    .log-table th { background: #f5f5f5; padding: 10px 12px; text-align: left; font-size: 13px; font-weight: 600; border-bottom: 1px solid #e0e0e0; }
+    .log-table td { padding: 8px 12px; font-size: 13px; border-bottom: 1px solid #f0f0f0; font-family: 'SF Mono', monospace; }
+    .log-table tr:last-child td { border-bottom: none; }
+    .dot-src { color: #0a8a0a; }
+    .dot-tgt { color: #d32f2f; }
+    .instruction { background: #fffde7; border: 1px solid #fff59d; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
+    .instruction strong { color: #f57f17; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1>CrossMatch &mdash; Cross-Platform Action Matching</h1>
+  <p id="status" class="loading">Loading model...</p>
+</div>
+
+<div class="container">
+  <div class="instruction">
+    <strong>How to use:</strong> Upload screenshots for both devices. Select action mode (Click or Scroll).
+    <strong>Click</strong> directly on the source image to set the action point &mdash; the model will predict the corresponding point on the target.
+    For <strong>Scroll</strong>, click the start point, then click the end point on the source image.
+  </div>
+
+  <div class="controls">
+    <label>Mode:</label>
+    <select id="actionType">
+      <option value="click">Click</option>
+      <option value="scroll">Scroll</option>
+    </select>
+    <label>Source size:</label>
+    <input type="number" id="srcW" value="1080"> x <input type="number" id="srcH" value="1920">
+    <label>Target size:</label>
+    <input type="number" id="tgtW" value="1170"> x <input type="number" id="tgtH" value="2532">
+    <button class="btn btn-danger" id="clearBtn">Clear All</button>
+  </div>
+
+  <div class="panels">
+    <!-- Source panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <h3>Source Device</h3>
+        <div>
+          <input type="file" id="srcFile" accept="image/*" style="font-size:13px;">
+        </div>
+      </div>
+      <div class="canvas-wrap" id="srcWrap">
+        <canvas id="srcCanvas" width="540" height="960"></canvas>
+        <div class="empty-state" id="srcEmpty">Upload a screenshot</div>
+      </div>
+      <div class="panel-footer" id="srcInfo">No action set</div>
+    </div>
+
+    <!-- Target panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <h3>Target Device</h3>
+        <div>
+          <input type="file" id="tgtFile" accept="image/*" style="font-size:13px;">
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="tgtCanvas" width="540" height="960"></canvas>
+        <div class="empty-state" id="tgtEmpty">Upload a screenshot</div>
+      </div>
+      <div class="panel-footer" id="tgtInfo">Waiting for prediction...</div>
+    </div>
+  </div>
+
+  <!-- Metrics -->
+  <div class="metrics" id="metricsSection" style="display:none;">
+    <h3>Test Metrics</h3>
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="value" id="metricTests">0</div>
+        <div class="label">Tests Run</div>
+      </div>
+      <div class="metric-card">
+        <div class="value" id="metricLatency">-</div>
+        <div class="label">Avg Latency (ms)</div>
+      </div>
+      <div class="metric-card">
+        <div class="value" id="metricLastLatency">-</div>
+        <div class="label">Last Latency (ms)</div>
+      </div>
+      <div class="metric-card">
+        <div class="value" id="metricProvider">-</div>
+        <div class="label">Backend</div>
+      </div>
+    </div>
+    <table class="log-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Action</th>
+          <th>Source Coords</th>
+          <th>Predicted Coords</th>
+          <th>Latency</th>
+        </tr>
+      </thead>
+      <tbody id="logBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.all.min.js"></script>
+<script type="module">
+  import { CrossMatchService } from "./src/cross_match_service.js";
+
+  const service = new CrossMatchService();
+  const statusEl = document.getElementById("status");
+
+  // State
+  let srcImage = null;
+  let tgtImage = null;
+  let scrollStart = null; // for 2-click scroll
+  let testLog = [];
+
+  // Elements
+  const srcCanvas = document.getElementById("srcCanvas");
+  const tgtCanvas = document.getElementById("tgtCanvas");
+  const srcCtx = srcCanvas.getContext("2d");
+  const tgtCtx = tgtCanvas.getContext("2d");
+
+  // Load model
+  const MODEL_URL = "./models/cross_match.onnx";
+  service.init(MODEL_URL, { executionProvider: "webgpu" }).then(() => {
+    statusEl.textContent = "Model loaded. Click on the source image to predict.";
+    statusEl.className = "ready";
+  }).catch((err) => {
+    statusEl.textContent = "Error: " + err.message;
+    statusEl.className = "error";
+  });
+
+  // File loaders
+  function loadImage(file, canvas, ctx, emptyEl, callback) {
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = Math.round(canvas.width * (img.height / img.width));
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      emptyEl.style.display = "none";
+      callback(img);
+    };
+    img.src = URL.createObjectURL(file);
+  }
+
+  document.getElementById("srcFile").addEventListener("change", (e) => {
+    if (e.target.files[0]) loadImage(e.target.files[0], srcCanvas, srcCtx, document.getElementById("srcEmpty"), (img) => { srcImage = img; });
+  });
+  document.getElementById("tgtFile").addEventListener("change", (e) => {
+    if (e.target.files[0]) loadImage(e.target.files[0], tgtCanvas, tgtCtx, document.getElementById("tgtEmpty"), (img) => {
+      tgtImage = img;
+      // Pre-cache target tensor so first click is fast
+      if (service.ready) service.preloadTarget(img);
+    });
+  });
+
+  // Drawing helpers
+  function drawCrosshair(ctx, x, y, color, label) {
+    const r = 12;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r - 4, y); ctx.lineTo(x + r + 4, y);
+    ctx.moveTo(x, y - r - 4); ctx.lineTo(x, y + r + 4);
+    ctx.stroke();
+    if (label) {
+      ctx.font = "bold 12px system-ui";
+      ctx.fillStyle = color;
+      ctx.fillText(label, x + r + 6, y - 4);
+    }
+    ctx.restore();
+  }
+
+  function drawArrow(ctx, x1, y1, x2, y2, color) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Arrowhead
+    const angle = Math.atan2(y2 - y1, x2 - x1);
+    const headLen = 14;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - headLen * Math.cos(angle - 0.4), y2 - headLen * Math.sin(angle - 0.4));
+    ctx.lineTo(x2 - headLen * Math.cos(angle + 0.4), y2 - headLen * Math.sin(angle + 0.4));
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function redrawSource() {
+    if (!srcImage) return;
+    srcCtx.drawImage(srcImage, 0, 0, srcCanvas.width, srcCanvas.height);
+  }
+
+  function redrawTarget() {
+    if (!tgtImage) return;
+    tgtCtx.drawImage(tgtImage, 0, 0, tgtCanvas.width, tgtCanvas.height);
+  }
+
+  // Yield to browser so canvas paint is flushed before heavy compute
+  function flush() {
+    return new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
+  }
+
+  // Click handler on source canvas
+  srcCanvas.addEventListener("click", async (e) => {
+    if (!service.ready || !srcImage || !tgtImage) {
+      statusEl.textContent = "Load both images first.";
+      return;
+    }
+
+    const rect = srcCanvas.getBoundingClientRect();
+    const canvasX = e.clientX - rect.left;
+    const canvasY = e.clientY - rect.top;
+    const scaleX = srcImage.width / srcCanvas.width;
+    const scaleY = srcImage.height / srcCanvas.height;
+    const imgX = Math.round(canvasX * scaleX);
+    const imgY = Math.round(canvasY * scaleY);
+
+    const actionType = document.getElementById("actionType").value;
+
+    if (actionType === "scroll") {
+      if (!scrollStart) {
+        scrollStart = { canvasX, canvasY, imgX, imgY };
+        redrawSource();
+        drawCrosshair(srcCtx, canvasX, canvasY, "#0a8a0a", "FROM");
+        document.getElementById("srcInfo").textContent = `Scroll start: (${imgX}, ${imgY}) — click end point`;
+        return;
+      }
+      const from = scrollStart;
+      scrollStart = null;
+
+      // Draw source indicators IMMEDIATELY
+      redrawSource();
+      drawCrosshair(srcCtx, from.canvasX, from.canvasY, "#0a8a0a", "FROM");
+      drawCrosshair(srcCtx, canvasX, canvasY, "#0a8a0a", "TO");
+      drawArrow(srcCtx, from.canvasX, from.canvasY, canvasX, canvasY, "#0a8a0a");
+      document.getElementById("srcInfo").textContent = `Scroll: (${from.imgX}, ${from.imgY}) → (${imgX}, ${imgY}) | Predicting...`;
+      document.getElementById("tgtInfo").textContent = "Running inference...";
+
+      // Flush paint before heavy compute
+      await flush();
+
+      const result = await service.predict({
+        sourceScreenshot: srcImage,
+        targetScreenshot: tgtImage,
+        action: { type: "scroll", sourceCoords: { from_arg: [from.imgX, from.imgY], to_arg: [imgX, imgY] } },
+        sourceSize: [+document.getElementById("srcW").value, +document.getElementById("srcH").value],
+        targetSize: [+document.getElementById("tgtW").value, +document.getElementById("tgtH").value],
+      });
+
+      showResult(result, "scroll", `(${from.imgX},${from.imgY})→(${imgX},${imgY})`);
+      return;
+    }
+
+    // Click mode — draw source indicator IMMEDIATELY
+    redrawSource();
+    drawCrosshair(srcCtx, canvasX, canvasY, "#0a8a0a", `(${imgX}, ${imgY})`);
+    document.getElementById("srcInfo").textContent = `Click at: (${imgX}, ${imgY}) | Predicting...`;
+    document.getElementById("tgtInfo").textContent = "Running inference...";
+
+    // Flush paint before heavy compute
+    await flush();
+
+    const result = await service.predict({
+      sourceScreenshot: srcImage,
+      targetScreenshot: tgtImage,
+      action: { type: "click", sourceCoords: { at: [imgX, imgY] } },
+      sourceSize: [+document.getElementById("srcW").value, +document.getElementById("srcH").value],
+      targetSize: [+document.getElementById("tgtW").value, +document.getElementById("tgtH").value],
+    });
+
+    showResult(result, "click", `(${imgX}, ${imgY})`);
+  });
+
+  function showResult(result, actionType, srcCoordsStr) {
+    redrawTarget();
+
+    const tw = +document.getElementById("tgtW").value;
+    const th = +document.getElementById("tgtH").value;
+    const tgtScaleX = tgtCanvas.width / tw;
+    const tgtScaleY = tgtCanvas.height / th;
+
+    let predStr;
+    if (result.type === "click") {
+      const [px, py] = result.targetCoords.at;
+      drawCrosshair(tgtCtx, px * tgtScaleX, py * tgtScaleY, "#d32f2f", `(${px}, ${py})`);
+      predStr = `(${px}, ${py})`;
+    } else {
+      const [fx, fy] = result.targetCoords.from_arg;
+      const [tx, ty] = result.targetCoords.to_arg;
+      drawCrosshair(tgtCtx, fx * tgtScaleX, fy * tgtScaleY, "#d32f2f", "FROM");
+      drawCrosshair(tgtCtx, tx * tgtScaleX, ty * tgtScaleY, "#d32f2f", "TO");
+      drawArrow(tgtCtx, fx * tgtScaleX, fy * tgtScaleY, tx * tgtScaleX, ty * tgtScaleY, "#d32f2f");
+      predStr = `(${fx},${fy})->(${tx},${ty})`;
+    }
+
+    document.getElementById("srcInfo").textContent = `Source ${actionType}: ${srcCoordsStr}`;
+    document.getElementById("tgtInfo").textContent = `Predicted: ${predStr} | ${result.latencyMs}ms`;
+
+    // Log
+    testLog.push({ actionType, srcCoords: srcCoordsStr, predCoords: predStr, latency: result.latencyMs });
+    updateMetrics();
+  }
+
+  function updateMetrics() {
+    document.getElementById("metricsSection").style.display = "block";
+    document.getElementById("metricTests").textContent = testLog.length;
+    const avgLat = Math.round(testLog.reduce((s, t) => s + t.latency, 0) / testLog.length);
+    document.getElementById("metricLatency").textContent = avgLat;
+    document.getElementById("metricLastLatency").textContent = testLog[testLog.length - 1].latency;
+    document.getElementById("metricProvider").textContent = service.backend || "auto";
+
+    const tbody = document.getElementById("logBody");
+    tbody.innerHTML = "";
+    for (let i = testLog.length - 1; i >= 0; i--) {
+      const t = testLog[i];
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${i + 1}</td><td>${t.actionType}</td><td class="dot-src">${t.srcCoords}</td><td class="dot-tgt">${t.predCoords}</td><td>${t.latency}ms</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  // Clear
+  document.getElementById("clearBtn").addEventListener("click", () => {
+    testLog = [];
+    scrollStart = null;
+    redrawSource();
+    redrawTarget();
+    document.getElementById("srcInfo").textContent = "No action set";
+    document.getElementById("tgtInfo").textContent = "Waiting for prediction...";
+    document.getElementById("metricsSection").style.display = "none";
+  });
+</script>
+</body>
+</html>

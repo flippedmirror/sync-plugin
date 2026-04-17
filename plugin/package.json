@@ -1,0 +1,14 @@
+{
+  "name": "cross-match-plugin",
+  "version": "0.1.0",
+  "description": "Cross-platform UI action matching service for BrowserStack App Live",
+  "main": "src/cross_match_service.js",
+  "scripts": {
+    "build": "npx esbuild src/cross_match_service.js --bundle --outfile=dist/cross_match_service.bundle.js --format=esm --platform=browser --external:onnxruntime-web",
+    "test": "node src/test_service.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.24.3",
+    "onnxruntime-web": "^1.21.0"
+  }
+}
