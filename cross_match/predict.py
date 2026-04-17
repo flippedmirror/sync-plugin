@@ -50,7 +50,26 @@ class CrossMatchPredictor:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model_config = checkpoint.get("model_config", ModelConfig())
         self.model = CrossMatchModel(model_config).to(device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load state_dict, handling encoder key mismatches between torch.hub and HF DINOv2.
+        # The encoder is frozen/pretrained — only the head weights matter from the checkpoint.
+        saved_state = checkpoint["model_state_dict"]
+        model_state = self.model.state_dict()
+
+        # Filter: load keys that exist in both and have matching shapes
+        compatible = {}
+        skipped_encoder = 0
+        for k, v in saved_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                compatible[k] = v
+            elif k.startswith("encoder."):
+                skipped_encoder += 1
+
+        model_state.update(compatible)
+        self.model.load_state_dict(model_state)
+
+        if skipped_encoder > 0:
+            print("  Note: {} encoder keys skipped (different DINOv2 backend, using fresh pretrained weights)".format(skipped_encoder))
         self.model.eval()
 
         self.image_size = model_config.image_size
