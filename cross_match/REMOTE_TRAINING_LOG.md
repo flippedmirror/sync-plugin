@@ -119,6 +119,30 @@ The v2 synthetic generator (`cross_match/synthetic_v2.py`) adds visual diversity
 
 This produces significantly more visual diversity than v1's flat colored rectangles, leading to better generalization.
 
+## Known Limitation: Training Data Y-Distribution Bias
+
+Analysis of the training data revealed a severe vertical distribution bias in generated click actions:
+
+| Screen Region | % of Click Actions |
+|---|---|
+| Top 0-25% | **77%** |
+| Mid 25-50% | 23% |
+| Mid 50-75% | **0%** |
+| Bottom 75-100% | **0%** |
+
+The max Y-coordinate in the dataset is 0.48 (48% down the screen). **The model has never seen a click in the bottom half of the screen.**
+
+**Root cause:** The `synthetic_v2.py` generator builds UI sections top-down with a cursor (`y_cursor`) starting at the header and adding elements sequentially. Each section adds vertical spacing, and the cursor frequently exhausts the available space (max_y = 90% of screen height) before reaching the lower half. Clickable elements cluster in the upper portion because they're generated first.
+
+**Observed impact:** When clicking on lower-screen elements (Y > 50%) in the demo, the model predicts coordinates in the upper-mid region (~30-40% down). The error is proportional to how far below the midpoint the actual click is. Top-of-screen clicks are accurate (within 20-30px), bottom-of-screen clicks are wildly off (500px+ error).
+
+**Fix required:** The synthetic generator needs to:
+1. Distribute element Y-positions uniformly across the full 6-90% screen range
+2. Ensure click action annotations sample uniformly from all generated elements, not biased toward early (top) sections
+3. Validate that the training set has roughly equal representation across all screen quartiles
+
+This is a data distribution problem, not a model architecture issue. The model architecture (DINOv2 + cross-attention) is capable of full-screen matching — it just hasn't been trained on bottom-half examples.
+
 ## Artifacts
 
 | File | Location |
