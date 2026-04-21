@@ -274,7 +274,19 @@ Coordinates are in **pixel space** relative to the original screenshot dimension
 
 ### Data Sources
 
-1. **Synthetic generation** (`cross_match/synthetic.py`) — colored UI elements on gradient backgrounds with proportional coordinate scaling + jitter. Good for initial validation but limited visual diversity.
+1. **Synthetic generation** — progressively improved through 3 generator versions:
+
+   - **v1** (`cross_match/synthetic.py`) — flat colored rectangles on solid backgrounds. Good for initial validation but limited visual diversity.
+
+   - **v2** (`cross_match/synthetic_v2.py`) — gradient backgrounds, shadows, icons, cards, toggles, nav bars, platform-specific palettes. Significant visual diversity improvement, but has a **Y-distribution bias**: top-down `y_cursor` layout causes 77% of click actions to land in the top 25% of the screen, with 0% below the midpoint. Root cause: elements are placed sequentially and exhaust vertical space before reaching the lower half.
+
+   - **v4** (`cross_match/synthetic_v4.py`) — current generator, fixes all known v2 issues:
+     - **Slot-based layout:** screen divided into 6–12 equal vertical slots (6%–90% Y range), one element per slot, guaranteeing uniform spatial coverage
+     - **Multi-resolution:** 4 Android devices (720×1600 to 1440×2560) + 4 iOS devices (750×1334 to 1290×2796), any-to-any pairing including same-OS different-device
+     - **Resolution-scaled fonts:** text sizes scale proportionally to `screen_height / 1920`, keeping visuals consistent across resolutions
+     - **Icon-only elements:** FAB (floating action button with + icon), icon buttons (hamburger, back arrow, close X, bell), icon-only nav bars — ~39% of click actions target icon-based elements
+     - **Distribution stats in annotations.json:** source + target Y quartile distributions, resolution counts, and element type breakdowns are computed and embedded automatically for validation
+     - Validated Y-distribution: ~21/28/29/22% across quartiles (source and target)
 
 2. **BrowserStack same-OS sync recordings** — record action mappings between two same-OS devices (e.g., Android to Android), then use those mappings as ground truth for cross-platform training by pairing with a different platform's screenshot of the same app state.
 
@@ -283,7 +295,7 @@ Coordinates are in **pixel space** relative to the original screenshot dimension
 4. **Augmentation strategies:**
    - Random crop/pad (simulate different screen regions)
    - Color jitter on backgrounds (vary app themes)
-   - Resolution variation (different device densities)
+   - Resolution variation (different device densities) — now built into v4 generator
    - Element reordering (same elements, different layout)
 
 ### What the model needs to learn
@@ -306,8 +318,8 @@ Coordinates are in **pixel space** relative to the original screenshot dimension
 ## Usage
 
 ```bash
-# Generate synthetic training data
-python -m cross_match.synthetic --output-dir data/cross_match --num-pairs 10000
+# Generate synthetic training data (v4 — multi-resolution, uniform Y distribution)
+python -m cross_match.synthetic_v4 --output-dir data/cross_match_v4 --num-pairs 5000
 
 # Train (CUDA)
 python -m cross_match.train --data-dir data/cross_match --output-dir checkpoints/cross_match --device cuda
