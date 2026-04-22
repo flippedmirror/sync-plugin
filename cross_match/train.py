@@ -5,7 +5,18 @@ Two training phases:
   Phase 2 (fine-tune): Unfreeze encoder with very low lr for final epochs.
 
 Usage:
-    python -m cross_match.train --data-dir data/cross_match_v2 --output-dir checkpoints/cross_match_v2 --device cuda
+    # Calibration run (5K pairs, 5 epochs)
+    python -m cross_match.train --data-dir data/cross_match_v5 --output-dir checkpoints/v5_calibration \
+        --epochs 5 --finetune-epochs 0 --batch-size 64 --device cuda
+
+    # Full run Phase 1 (20K pairs, 30 frozen epochs)
+    python -m cross_match.train --data-dir data/cross_match_v5 --output-dir checkpoints/v5_full \
+        --epochs 30 --finetune-epochs 0 --batch-size 64 --lr 1e-4 --device cuda --amp
+
+    # Full run Phase 2 (fine-tune from Phase 1 best checkpoint)
+    python -m cross_match.train --data-dir data/cross_match_v5 --output-dir checkpoints/v5_full \
+        --epochs 5 --finetune-epochs 5 --batch-size 32 --lr 1e-6 --device cuda --amp \
+        --resume checkpoints/v5_full/best.pt
 """
 
 from __future__ import annotations
@@ -106,12 +117,13 @@ def compute_loss(outputs, target_coords, source_action, coord_weight=1.0, action
     return total, {"total": total.item(), "coord": coord_loss.item(), "action": action_loss.item()}
 
 
-def train_epoch(model, loader, optimizer, device, config, use_cached=False):
+def train_epoch(model, loader, optimizer, device, config, use_cached=False, scaler=None):
     model.train()
     if model.config.freeze_encoder:
         model.encoder.eval()
 
     total_loss, total_coord, total_action, n = 0.0, 0.0, 0.0, 0
+    use_amp = scaler is not None
 
     for batch in loader:
         if use_cached:
@@ -123,13 +135,21 @@ def train_epoch(model, loader, optimizer, device, config, use_cached=False):
         src_action = batch["source_action"].to(device)
         tgt_coords = batch["target_coords"].to(device)
 
-        outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
-        loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
+            loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
 
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
         total_loss += ld["total"]; total_coord += ld["coord"]; total_action += ld["action"]; n += 1
 
@@ -137,7 +157,7 @@ def train_epoch(model, loader, optimizer, device, config, use_cached=False):
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, device, config, use_cached=False):
+def eval_epoch(model, loader, device, config, use_cached=False, use_amp=False):
     model.eval()
     total_loss, n = 0.0, 0
     all_dists = []
@@ -153,11 +173,12 @@ def eval_epoch(model, loader, device, config, use_cached=False):
         src_action = batch["source_action"].to(device)
         tgt_coords = batch["target_coords"].to(device)
 
-        outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
-        loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model.forward_cached(src, src_coords, src_action, tgt) if use_cached else model(src, src_coords, src_action, tgt)
+            loss, ld = compute_loss(outputs, tgt_coords, src_action, config.coord_loss_weight, config.action_loss_weight)
         total_loss += ld["total"]
 
-        pred = outputs["target_coords"]
+        pred = outputs["target_coords"].float()
         dists = torch.sqrt(((pred[:, :2] - tgt_coords[:, :2]) ** 2).sum(dim=1))
         all_dists.extend(dists.cpu().tolist())
 
@@ -168,20 +189,27 @@ def eval_epoch(model, loader, device, config, use_cached=False):
 
     if not all_dists:
         return {"loss": 0, "coord_dist_norm": 0, "coord_dist_px_mean": 0, "coord_dist_px_median": 0,
-                "hit_20px": 0, "hit_50px": 0, "hit_100px": 0, "action_acc": 0}
+                "hit_10px": 0, "hit_20px": 0, "hit_30px": 0, "hit_50px": 0, "hit_75px": 0, "hit_100px": 0,
+                "action_acc": 0}
 
     diag = math.sqrt(REF_SCREEN[0] ** 2 + REF_SCREEN[1] ** 2)
     px_dists = [d * diag for d in all_dists]
     sorted_px = sorted(px_dists)
+    nd = len(px_dists)
 
     return {
         "loss": total_loss / n,
-        "coord_dist_norm": sum(all_dists) / len(all_dists),
-        "coord_dist_px_mean": sum(px_dists) / len(px_dists),
-        "coord_dist_px_median": sorted_px[len(sorted_px) // 2],
-        "hit_20px": sum(1 for d in px_dists if d <= 20) / len(px_dists),
-        "hit_50px": sum(1 for d in px_dists if d <= 50) / len(px_dists),
-        "hit_100px": sum(1 for d in px_dists if d <= 100) / len(px_dists),
+        "coord_dist_norm": sum(all_dists) / nd,
+        "coord_dist_px_mean": sum(px_dists) / nd,
+        "coord_dist_px_median": sorted_px[nd // 2],
+        "coord_dist_px_p95": sorted_px[int(nd * 0.95)] if nd > 1 else sorted_px[0],
+        "hit_10px": sum(1 for d in px_dists if d <= 10) / nd,
+        "hit_20px": sum(1 for d in px_dists if d <= 20) / nd,
+        "hit_30px": sum(1 for d in px_dists if d <= 30) / nd,
+        "hit_50px": sum(1 for d in px_dists if d <= 50) / nd,
+        "hit_75px": sum(1 for d in px_dists if d <= 75) / nd,
+        "hit_100px": sum(1 for d in px_dists if d <= 100) / nd,
+        "hit_150px": sum(1 for d in px_dists if d <= 150) / nd,
         "action_acc": action_correct / action_total if action_total > 0 else 0.0,
     }
 
@@ -205,15 +233,31 @@ def main(args):
     config = TrainConfig(
         data_dir=args.data_dir, output_dir=args.output_dir, device=args.device,
         batch_size=args.batch_size, num_epochs=args.epochs,
+        lr=args.lr, warmup_epochs=args.warmup_epochs,
         cache_features=not args.no_cache, finetune_epochs=args.finetune_epochs, log_every=args.log_every,
     )
+    if args.finetune_lr:
+        config.finetune_lr = args.finetune_lr
     model_config = ModelConfig()
     os.makedirs(config.output_dir, exist_ok=True)
     device = config.device
     progress_path = os.path.join(config.output_dir, "progress.json")
+    use_amp = args.amp and device == "cuda"
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    cache_bs = args.cache_batch_size
 
     print("Initializing CrossMatch model...")
     model = CrossMatchModel(model_config).to(device)
+
+    if args.resume:
+        print("  Resuming from checkpoint: {}".format(args.resume))
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        print("  Loaded model state from epoch {}".format(ckpt.get("epoch", "?")))
+        if args.finetune_epochs > 0:
+            print("  Unfreezing encoder for fine-tuning")
+            for param in model.encoder.parameters():
+                param.requires_grad = True
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print("  Total params: {:.1f}M | Trainable: {:.1f}M".format(total_params / 1e6, trainable / 1e6))
@@ -223,7 +267,7 @@ def main(args):
 
     use_cached = config.cache_features
     if use_cached:
-        cache_features(model, raw_dataset, config.cache_dir, device, batch_size=64)
+        cache_features(model, raw_dataset, config.cache_dir, device, batch_size=cache_bs)
         dataset = CachedFeatureDataset(config.data_dir, config.cache_dir, model_config.image_size)
     else:
         dataset = raw_dataset
@@ -243,8 +287,10 @@ def main(args):
         raw_train_loader = DataLoader(raw_train, batch_size=config.batch_size, shuffle=True, num_workers=nw, pin_memory=pin)
         raw_val_loader = DataLoader(raw_val, batch_size=config.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
 
-    print("  Train: {} | Val: {} | Device: {}".format(n_train, n_val, device))
-    print("  Epochs: {} (frozen: {}, fine-tune: {})".format(config.num_epochs, config.num_epochs - config.finetune_epochs, config.finetune_epochs))
+    print("  Train: {} | Val: {} | Device: {} | AMP: {}".format(n_train, n_val, device, use_amp))
+    print("  Epochs: {} (frozen: {}, fine-tune: {}) | LR: {} | Batch: {}".format(
+        config.num_epochs, config.num_epochs - config.finetune_epochs, config.finetune_epochs,
+        config.lr, config.batch_size))
     print()
 
     optimizer = torch.optim.AdamW(
@@ -284,8 +330,8 @@ def main(args):
             cur_train_loader = train_loader
             cur_val_loader = val_loader
 
-        train_m = train_epoch(model, cur_train_loader, optimizer, device, config, cur_use_cached)
-        val_m = eval_epoch(model, cur_val_loader, device, config, cur_use_cached)
+        train_m = train_epoch(model, cur_train_loader, optimizer, device, config, cur_use_cached, scaler=scaler)
+        val_m = eval_epoch(model, cur_val_loader, device, config, cur_use_cached, use_amp=use_amp)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -304,11 +350,11 @@ def main(args):
         history.append(entry)
 
         print("[{}] Epoch {:3d}/{} ({:.1f}s) lr={:.2e} | train={:.4f} val={:.4f} | "
-              "px_mean={:.0f} px_med={:.0f} | @20={:.0%} @50={:.0%} @100={:.0%} | act={:.0%}".format(
+              "px_mean={:.0f} px_med={:.0f} p95={:.0f} | @10={:.0%} @20={:.0%} @50={:.0%} @100={:.0%} | act={:.0%}".format(
             phase, epoch + 1, config.num_epochs, elapsed, lr,
             train_m["loss"], val_m["loss"],
-            val_m["coord_dist_px_mean"], val_m["coord_dist_px_median"],
-            val_m["hit_20px"], val_m["hit_50px"], val_m["hit_100px"], val_m["action_acc"]))
+            val_m["coord_dist_px_mean"], val_m["coord_dist_px_median"], val_m.get("coord_dist_px_p95", 0),
+            val_m.get("hit_10px", 0), val_m["hit_20px"], val_m["hit_50px"], val_m["hit_100px"], val_m["action_acc"]))
 
         write_progress(progress_path, epoch + 1, config.num_epochs, phase, train_m, val_m, elapsed, total_time)
 
@@ -352,8 +398,14 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--finetune-epochs", type=int, default=5)
+    parser.add_argument("--finetune-lr", type=float, default=None)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--cache-batch-size", type=int, default=64, help="Batch size for feature caching")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision training (fp16)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     main(args)
