@@ -1,7 +1,7 @@
-# Synthetic Data V5 — Strategy & Design
+# Synthetic Data V5/V5.1 — Strategy & Design
 
-**Date**: 22 April 2026  
-**Status**: Implemented, pending large-scale generation + training
+**Date**: 22-23 April 2026  
+**Status**: V5 trained (5K, 25ep). V5.1 generating (pairing strategies for semantic matching).
 
 ---
 

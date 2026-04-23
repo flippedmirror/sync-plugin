@@ -1,8 +1,8 @@
-# CrossMatch Training V5 — L40S Training Plan & Results
+# CrossMatch Training V5/V5.1 — L40S Training Plan & Results
 
-**Date**: 22 April 2026  
+**Date**: 22-23 April 2026  
 **GPU**: NVIDIA L40S (48GB VRAM, Ada Lovelace)  
-**Data**: Synthetic v5 (archetypes + SVG icons + varied resolutions)
+**Data**: V5 (archetypes + SVG icons + varied resolutions), V5.1 (+ pairing strategies for semantic matching)
 
 ---
 
@@ -81,18 +81,34 @@ L40S at ~$1.00-1.50/hr on-demand → **~$1.50 total**
 
 ## 4. Results
 
-### Calibration Run (5K pairs, 5 epochs)
+### V5 Calibration Run (5K v5 pairs, 5+25 epochs, L40S)
 
-_Pending — results will be added here after run completes._
+**Data**: 5K v5 pairs (proportional coordinate mapping only, no pairing strategies)  
+**Total training time**: 3.8 min (5 epochs) + 10.6 min (25 more epochs) = ~15 min  
+**Feature caching**: 10K images at 20 img/s = ~8 min
 
-| Epoch | Train Loss | Val Loss | Mean px | @20px | @50px | @100px | Time |
-|---|---|---|---|---|---|---|---|
-| 1 | | | | | | | |
-| 2 | | | | | | | |
-| 3 | | | | | | | |
-| 4 | | | | | | | |
-| 5 | | | | | | | |
+| Epoch | Train Loss | Val Loss | Mean px | Median px | p95 | @10px | @20px | @50px | @100px | Time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.0711 | 0.0512 | 884 | 903 | 1470 | 0% | 0% | 0% | 0% | 95s |
+| 2 | 0.0125 | 0.0022 | 127 | 118 | 255 | 0% | 2% | 12% | 39% | 35s |
+| 4 | 0.0004 | 0.0003 | 63 | 56 | 137 | 2% | 8% | 43% | 85% | 32s |
+| **5** | **0.0002** | **0.0002** | **54** | **48** | **117** | **3%** | **12%** | **53%** | **91%** | **29s** |
+| *Resumed from epoch 5 checkpoint (lr=5e-5, warmup=3):* |
+| +7 | 0.0001 | 0.0001 | 39 | 34 | 81 | 7% | 23% | 73% | 98% | 28s |
+| +9 | 0.0001 | 0.0001 | 33 | 29 | 71 | 9% | 30% | 81% | 99% | 30s |
+| +15 | 0.0000 | 0.0001 | 32 | 30 | 63 | 9% | 29% | 87% | 100% | 28s |
+| **+17** | **0.0000** | **0.0000** | **28** | **26** | **59** | **12%** | **36%** | **91%** | **100%** | **29s** |
+| +21 | 0.0000 | 0.0000 | 29 | 26 | 59 | 10% | 33% | 91% | 100% | 31s |
+| +25 | 0.0000 | 0.0000 | 29 | 26 | 59 | 11% | 33% | 91% | 100% | 29s |
 
-### Full Run (20K pairs, 30+5 epochs)
+**Converged at epoch ~17**: 28px mean, 91% @50px, 100% @100px.
 
-_Pending — results will be added here after run completes._
+**Key observation**: The model achieved good synthetic accuracy but learned to match by **position scaling** rather than visual content. On real device screenshots, accuracy was poor because the model couldn't find elements at positions different from the training distribution.
+
+### V5.1 Training (5K-15K v5.1 pairs, pairing strategies)
+
+_Pending — training with new pairing strategy data (proportional 45% + independent 40% + shuffled 15% + identity 12%)._
+
+### Full Run (15-20K pairs, 30+5 epochs)
+
+_Pending._
