@@ -279,10 +279,8 @@ def main(args):
     nw = 0 if device == "mps" else config.num_workers
     pin = device not in ("mps", "cpu")
 
-    persistent = nw > 0
-    prefetch = 4 if nw > 0 else None
-    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, num_workers=nw, pin_memory=pin, persistent_workers=persistent, prefetch_factor=prefetch)
-    val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, num_workers=nw, pin_memory=pin, persistent_workers=persistent, prefetch_factor=prefetch)
+    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, num_workers=nw, pin_memory=pin)
+    val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, num_workers=nw, pin_memory=pin)
 
     if use_cached:
         raw_train, raw_val = random_split(raw_dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
