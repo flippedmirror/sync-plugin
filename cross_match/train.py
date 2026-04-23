@@ -404,7 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--finetune-lr", type=float, default=None)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--cache-batch-size", type=int, default=64, help="Batch size for feature caching")
+    parser.add_argument("--cache-batch-size", type=int, default=16, help="Batch size for feature caching (16 safest for CUDA compat)")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision training (fp16)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
