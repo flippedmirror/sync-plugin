@@ -251,7 +251,7 @@ def main(args):
 
     if args.resume:
         print("  Resuming from checkpoint: {}".format(args.resume))
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         print("  Loaded model state from epoch {}".format(ckpt.get("epoch", "?")))
         if args.finetune_epochs > 0:
