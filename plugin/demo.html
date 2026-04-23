@@ -61,6 +61,12 @@
   </div>
 
   <div class="controls">
+    <label>Model:</label>
+    <select id="modelSelect">
+      <option value="./models/cross_match.onnx">v2 (original, 5K synthetic v2)</option>
+      <option value="./models/cross_match_v5.onnx" selected>v5 (5K synthetic v5, 25ep)</option>
+    </select>
+    <button class="btn btn-primary" id="loadModelBtn">Load Model</button>
     <label>Mode:</label>
     <select id="actionType">
       <option value="click">Click</option>
@@ -161,33 +167,55 @@
   const tgtCtx = tgtCanvas.getContext("2d");
 
   // Load model
-  const MODEL_URL = "./models/cross_match.onnx";
-  service.init(MODEL_URL, { executionProvider: "webgpu" }).then(() => {
-    statusEl.textContent = "Model loaded. Click on the source image to predict.";
-    statusEl.className = "ready";
-  }).catch((err) => {
-    statusEl.textContent = "Error: " + err.message;
-    statusEl.className = "error";
-  });
+  const modelSelect = document.getElementById("modelSelect");
+  const loadModelBtn = document.getElementById("loadModelBtn");
+
+  async function loadSelectedModel() {
+    const url = modelSelect.value;
+    const label = modelSelect.options[modelSelect.selectedIndex].text;
+    statusEl.textContent = "Loading model: " + label + "...";
+    statusEl.className = "loading";
+    loadModelBtn.disabled = true;
+    try {
+      await service.dispose();
+      await service.init(url, { executionProvider: "webgpu", useCache: false });
+      statusEl.textContent = "Model loaded: " + label + ". Click on the source image to predict.";
+      statusEl.className = "ready";
+    } catch (err) {
+      statusEl.textContent = "Error loading " + label + ": " + err.message;
+      statusEl.className = "error";
+    }
+    loadModelBtn.disabled = false;
+  }
+
+  loadModelBtn.addEventListener("click", loadSelectedModel);
+  // Auto-load selected model on start
+  loadSelectedModel();
+
+  // Fixed canvas height — both panels use the same height for visual alignment
+  const CANVAS_HEIGHT = 700;
 
   // File loaders
-  function loadImage(file, canvas, ctx, emptyEl, callback) {
+  function loadImage(file, canvas, ctx, emptyEl, sizeWId, sizeHId, callback) {
     const img = new Image();
     img.onload = () => {
       canvas.width = canvas.parentElement.clientWidth;
-      canvas.height = Math.round(canvas.width * (img.height / img.width));
+      canvas.height = CANVAS_HEIGHT;
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       emptyEl.style.display = "none";
+      // Auto-fill screen size fields from actual image dimensions
+      document.getElementById(sizeWId).value = img.naturalWidth;
+      document.getElementById(sizeHId).value = img.naturalHeight;
       callback(img);
     };
     img.src = URL.createObjectURL(file);
   }
 
   document.getElementById("srcFile").addEventListener("change", (e) => {
-    if (e.target.files[0]) loadImage(e.target.files[0], srcCanvas, srcCtx, document.getElementById("srcEmpty"), (img) => { srcImage = img; });
+    if (e.target.files[0]) loadImage(e.target.files[0], srcCanvas, srcCtx, document.getElementById("srcEmpty"), "srcW", "srcH", (img) => { srcImage = img; });
   });
   document.getElementById("tgtFile").addEventListener("change", (e) => {
-    if (e.target.files[0]) loadImage(e.target.files[0], tgtCanvas, tgtCtx, document.getElementById("tgtEmpty"), (img) => {
+    if (e.target.files[0]) loadImage(e.target.files[0], tgtCanvas, tgtCtx, document.getElementById("tgtEmpty"), "tgtW", "tgtH", (img) => {
       tgtImage = img;
       // Pre-cache target tensor so first click is fast
       if (service.ready) service.preloadTarget(img);
@@ -261,8 +289,8 @@
     const rect = srcCanvas.getBoundingClientRect();
     const canvasX = e.clientX - rect.left;
     const canvasY = e.clientY - rect.top;
-    const scaleX = srcImage.width / srcCanvas.width;
-    const scaleY = srcImage.height / srcCanvas.height;
+    const scaleX = srcImage.naturalWidth / srcCanvas.width;
+    const scaleY = srcImage.naturalHeight / srcCanvas.height;
     const imgX = Math.round(canvasX * scaleX);
     const imgY = Math.round(canvasY * scaleY);
 
@@ -325,8 +353,9 @@
   function showResult(result, actionType, srcCoordsStr) {
     redrawTarget();
 
-    const tw = +document.getElementById("tgtW").value;
-    const th = +document.getElementById("tgtH").value;
+    // Use actual image dimensions for pixel-to-canvas mapping
+    const tw = tgtImage.naturalWidth;
+    const th = tgtImage.naturalHeight;
     const tgtScaleX = tgtCanvas.width / tw;
     const tgtScaleY = tgtCanvas.height / th;
 

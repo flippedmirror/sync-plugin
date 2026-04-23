@@ -100,11 +100,39 @@ Instead of fixed resolutions, each pair randomly selects from real device sizes:
 
 This teaches the model to handle different aspect ratios and resolutions, not just memorize one fixed mapping.
 
-### 3.5 Identity Pairs
+### 3.5 Pairing Strategies (Position Variability)
+
+A critical discovery during initial testing: when target coordinates are always a proportional scaling of source coordinates (`target = source * resolution_ratio + jitter`), the model learns a simple linear mapping without looking at the images. It matches by position, not by visual content.
+
+**Problem**: The model should learn "find the Chrome icon on the target screen" — not "scale coordinates by 1.08x, 1.32y".
+
+**Solution**: Four pairing strategies with different levels of position variability:
+
+| Strategy | Weight | How Target Coords Are Determined | What It Teaches |
+|---|---|---|---|
+| **Proportional** | 45% | `source_bbox * (target_size / source_size) + jitter(±12px)` | Basic resolution-aware coordinate scaling between devices |
+| **Independent** | 40% | Target screen regenerated with same elements but different layout RNG. Coords matched by semantic identity (type + text). | Visual element matching — model MUST look at images |
+| **Shuffled** | 15% | Proportional scaling but element bboxes randomly reordered across positions | Breaks pure position memorization |
+| **Identity** | ~12% | Same image, same coordinates | Exact coordinate preservation |
+
+**How independent pairing works**:
+1. Source screen is generated with a set of elements (e.g., 12 app icons: Chrome, Safari, Maps...)
+2. Target screen is generated with the **same element names** but a **different layout RNG** — different grid columns, different spacing, different margins
+3. Elements are matched by `(type, text)` identity — "icon/Chrome" on source maps to "icon/Chrome" on target, regardless of position
+4. Unmatched elements (present on source but not fitting on target layout) are excluded from training actions
+
+**Example**: Home screen pair with independent strategy:
+- Source: 4-column grid, Chrome at row 2 col 3 → position (810, 450)
+- Target: 3-column grid, Chrome at row 3 col 1 → position (195, 600)
+- The model must visually find Chrome, not just scale coordinates
+
+**Impact on training data**: Independent pairs have slightly fewer actions per pair (~2.1 vs ~2.6 for proportional) because some elements don't match between layouts. This is acceptable — quality > quantity for these pairs.
+
+### 3.6 Identity Pairs
 
 12% of generated pairs use the **same image** for both source and target (same size too). This forces the model to learn the trivial identity mapping — if source and target are identical, the output coordinates should equal the input coordinates. This directly addresses the observed "same image gives wrong coords" failure.
 
-### 3.6 Complex Backgrounds
+### 3.7 Complex Backgrounds
 
 - **Home screens**: Full mesh gradient wallpapers (3-4 color blobs blended with Gaussian blur)
 - **Other archetypes**: 30% chance of subtle vertical gradient instead of flat solid
@@ -117,7 +145,7 @@ Every archetype renders a status bar at the top with:
 - Battery indicator (rectangle with fill level)
 - Signal strength bars (4 ascending rectangles)
 
-### 3.8 Realistic Image Placeholders
+### 3.9 Realistic Image Placeholders
 
 Product cards contain photo-like rectangular areas rendered with one of 4 styles:
 - Vertical gradient (two random colors)
@@ -127,11 +155,11 @@ Product cards contain photo-like rectangular areas rendered with one of 4 styles
 
 These simulate the visual weight and variety of real product photos without requiring actual images.
 
-### 3.9 Slight Blur
+### 3.10 Slight Blur
 
 15% of generated images receive a subtle Gaussian blur (radius=0.8) to simulate the blurriness of real device streams captured at lower-than-native resolution via WebRTC.
 
-### 3.10 Y-Distribution Metrics
+### 3.11 Y-Distribution Metrics
 
 The generator computes and saves Y-distribution metrics at two levels:
 

@@ -313,7 +313,7 @@ def _draw_bottom_nav_text(draw, w, h, palette, fonts, rng, elements):
 
 # ─── Screen Archetype Generators ───
 
-def _gen_home_screen(sz, pal, rng, fonts, icon_paths, img):
+def _gen_home_screen(sz, pal, rng, fonts, icon_paths, img, content=None):
     w, h = sz
     draw = ImageDraw.Draw(img)
     elements = []
@@ -328,7 +328,8 @@ def _gen_home_screen(sz, pal, rng, fonts, icon_paths, img):
     cell_w = w // cols
     cell_h = icon_size + label_h + int(h * 0.02)
     grid_top = bar_h + int(h * 0.04)
-    names = rng.sample(APP_NAMES, min(cols * rows, len(APP_NAMES)))
+    max_icons = cols * rows
+    names = content["app_names"][:max_icons] if content and "app_names" in content else rng.sample(APP_NAMES, min(max_icons, len(APP_NAMES)))
     for row in range(rows):
         for col in range(cols):
             idx = row * cols + col
@@ -364,7 +365,7 @@ def _gen_home_screen(sz, pal, rng, fonts, icon_paths, img):
         elements.append({"bbox": [dx, dy, dx + d_icon, dy + d_icon], "type": "icon", "text": rng.choice(APP_NAMES)})
     return elements
 
-def _gen_product_list(sz, pal, rng, fonts, icon_paths, img):
+def _gen_product_list(sz, pal, rng, fonts, icon_paths, img, content=None):
     w, h = sz
     draw = ImageDraw.Draw(img)
     elements = []
@@ -383,7 +384,8 @@ def _gen_product_list(sz, pal, rng, fonts, icon_paths, img):
     draw.text((int(w * 0.1), fy), "{} Product(s)".format(cnt), fill=pal["text_secondary"], font=fonts["sm"])
     y = fy + int(h * 0.03)
     margin = int(w * 0.06)
-    for pname in rng.sample(PRODUCT_NAMES, min(rng.randint(2, 4), len(PRODUCT_NAMES))):
+    products = content["products"] if content and "products" in content else rng.sample(PRODUCT_NAMES, min(rng.randint(2, 4), len(PRODUCT_NAMES)))
+    for pname in products:
         if y > h * 0.85:
             break
         cw = w - 2 * margin
@@ -412,7 +414,7 @@ def _gen_product_list(sz, pal, rng, fonts, icon_paths, img):
     _draw_bottom_nav_text(draw, w, h, pal, fonts, rng, elements)
     return elements
 
-def _gen_settings(sz, pal, rng, fonts, icon_paths, img):
+def _gen_settings(sz, pal, rng, fonts, icon_paths, img, content=None):
     w, h = sz
     draw = ImageDraw.Draw(img)
     elements = []
@@ -426,7 +428,7 @@ def _gen_settings(sz, pal, rng, fonts, icon_paths, img):
     y = status_h + hdr_h + int(h * 0.02)
     margin = int(w * 0.05)
     num_rows = rng.randint(8, 14)
-    labels = rng.sample(NAV_LABELS, min(num_rows, len(NAV_LABELS)))
+    labels = content["labels"] if content and "labels" in content else rng.sample(NAV_LABELS, min(num_rows, len(NAV_LABELS)))
     avail = int(h * 0.90) - y
     row_h = max(int(h * 0.035), avail // len(labels))
     for label in labels:
@@ -454,7 +456,7 @@ def _gen_settings(sz, pal, rng, fonts, icon_paths, img):
         y += row_h + int(h * 0.005)
     return elements
 
-def _gen_form(sz, pal, rng, fonts, icon_paths, img):
+def _gen_form(sz, pal, rng, fonts, icon_paths, img, content=None):
     w, h = sz
     draw = ImageDraw.Draw(img)
     elements = []
@@ -518,7 +520,7 @@ def _gen_form(sz, pal, rng, fonts, icon_paths, img):
     elements.append({"bbox": [int((w - tw) // 2), ty, int((w + tw) // 2), ty + fonts["xs"].size], "type": "label", "text": ttxt})
     return elements
 
-def _gen_chat(sz, pal, rng, fonts, icon_paths, img):
+def _gen_chat(sz, pal, rng, fonts, icon_paths, img, content=None):
     w, h = sz
     draw = ImageDraw.Draw(img)
     elements = []
@@ -613,23 +615,80 @@ def generate_dataset(output_dir, num_pairs, seed=42, archetype_weights=None, pre
         src_sz = rng.choice(ANDROID_SIZES)
         tgt_sz = rng.choice(IOS_SIZES)
 
+        # Generate source screen
+        src_rng = random.Random(seed + i * 2)
         src_img = Image.new("RGB", src_sz, pal["bg"])
-        src_elems = gen(src_sz, pal, rng, fonts, icon_paths, src_img)
+        src_elems = gen(src_sz, pal, src_rng, fonts, icon_paths, src_img)
 
-        # Optional slight blur (15% chance) to simulate real device rendering
         if rng.random() < 0.15:
             src_img = src_img.filter(ImageFilter.GaussianBlur(radius=0.8))
 
         if is_id:
+            # Identity pair (12%): same image, same positions
             tgt_sz = src_sz
             tgt_img = src_img.copy()
             tgt_elems = [dict(e) for e in src_elems]
+            pair_strategy = "identity"
         else:
+            # Choose target strategy for position variability:
+            #   proportional (45%): scale bbox by resolution ratio + jitter (teaches resolution mapping)
+            #   independent  (40%): regenerate with same content, different layout (teaches semantic matching)
+            #   shuffled     (15%): proportional positions but elements reordered (breaks position-only learning)
+            strategy_roll = rng.random()
             tgt_pal = rng.choice(PALETTES)
-            tgt_img = Image.new("RGB", tgt_sz, tgt_pal["bg"])
-            gen(tgt_sz, tgt_pal, rng, fonts, icon_paths, tgt_img)
-            jrng = random.Random(seed + i + 50000)
-            tgt_elems = [{**e, "bbox": _scale_bbox(e["bbox"], src_sz, tgt_sz, jrng)} for e in src_elems]
+
+            if strategy_roll < 0.45:
+                # Proportional: scale + jitter (original approach)
+                tgt_img = Image.new("RGB", tgt_sz, tgt_pal["bg"])
+                tgt_rng = random.Random(seed + i * 2 + 1)
+                gen(tgt_sz, tgt_pal, tgt_rng, fonts, icon_paths, tgt_img)
+                jrng = random.Random(seed + i + 50000)
+                tgt_elems = [{**e, "bbox": _scale_bbox(e["bbox"], src_sz, tgt_sz, jrng)} for e in src_elems]
+                pair_strategy = "proportional"
+
+            elif strategy_roll < 0.85:
+                # Independent layout: same element content, different positions
+                # Pre-select shared content from source elements
+                content = {}
+                src_names = [e["text"] for e in src_elems if e["type"] == "icon"]
+                src_labels = [e["text"] for e in src_elems if e["type"] in ("label", "toggle")]
+                src_products = [e["text"] for e in src_elems if e["type"] == "card"]
+                if src_names: content["app_names"] = src_names
+                if src_labels: content["labels"] = src_labels
+                if src_products: content["products"] = src_products
+
+                tgt_rng = random.Random(seed + i * 2 + 1)
+                tgt_img = Image.new("RGB", tgt_sz, tgt_pal["bg"])
+                tgt_elems_raw = gen(tgt_sz, tgt_pal, tgt_rng, fonts, icon_paths, tgt_img, content=content)
+
+                # Match by semantic identity
+                tgt_lookup = {}
+                for e in tgt_elems_raw:
+                    key = (e["type"], e["text"])
+                    if key not in tgt_lookup:
+                        tgt_lookup[key] = e["bbox"]
+                tgt_elems = []
+                for e in src_elems:
+                    key = (e["type"], e["text"])
+                    if key in tgt_lookup:
+                        tgt_elems.append({**e, "bbox": tgt_lookup[key]})
+                    else:
+                        tgt_elems.append({**e, "bbox": None})
+                pair_strategy = "independent"
+
+            else:
+                # Shuffled: proportional scaling but elements in different order
+                tgt_img = Image.new("RGB", tgt_sz, tgt_pal["bg"])
+                tgt_rng = random.Random(seed + i * 2 + 1)
+                gen(tgt_sz, tgt_pal, tgt_rng, fonts, icon_paths, tgt_img)
+                jrng = random.Random(seed + i + 50000)
+                scaled = [{**e, "bbox": _scale_bbox(e["bbox"], src_sz, tgt_sz, jrng)} for e in src_elems]
+                # Shuffle the scaled bboxes while keeping element identities
+                bboxes = [e["bbox"] for e in scaled]
+                jrng.shuffle(bboxes)
+                tgt_elems = [{**e, "bbox": bb} for e, bb in zip(src_elems, bboxes)]
+                pair_strategy = "shuffled"
+
             if rng.random() < 0.15:
                 tgt_img = tgt_img.filter(ImageFilter.GaussianBlur(radius=0.8))
 
@@ -637,11 +696,14 @@ def generate_dataset(output_dir, num_pairs, seed=42, archetype_weights=None, pre
         tgt_img.save(os.path.join(tgt_dir, "{}.png".format(pid)))
 
         actions = []
-        clickable = [j for j, e in enumerate(src_elems) if e["type"] in ("button", "input", "card", "icon", "toggle")]
+        # Only use elements that have a valid match on both source and target
+        clickable = [j for j, e in enumerate(src_elems)
+                     if e["type"] in ("button", "input", "card", "icon", "toggle")
+                     and j < len(tgt_elems) and tgt_elems[j]["bbox"] is not None]
         if clickable:
             for idx in rng.sample(clickable, min(rng.randint(1, 3), len(clickable))):
                 sc = _bbox_center(src_elems[idx]["bbox"])
-                tc = _bbox_center(tgt_elems[idx]["bbox"]) if idx < len(tgt_elems) else sc
+                tc = _bbox_center(tgt_elems[idx]["bbox"])
                 actions.append({"type": "click", "source_coords": {"at": sc}, "target_coords": {"at": tc}})
         if rng.random() < 0.4:
             sx = rng.randint(int(src_sz[0] * 0.3), int(src_sz[0] * 0.7))
@@ -670,7 +732,7 @@ def generate_dataset(output_dir, num_pairs, seed=42, archetype_weights=None, pre
                 tgt_action_ys.append(a["target_coords"]["to_arg"][1] / tgt_sz[1])
 
         src_elem_ys = [((e["bbox"][1] + e["bbox"][3]) / 2) / src_sz[1] for e in src_elems]
-        tgt_elem_ys = [((e["bbox"][1] + e["bbox"][3]) / 2) / tgt_sz[1] for e in tgt_elems]
+        tgt_elem_ys = [((e["bbox"][1] + e["bbox"][3]) / 2) / tgt_sz[1] for e in tgt_elems if e["bbox"] is not None]
 
         def _quartile_dist(ys):
             if not ys:
@@ -707,7 +769,7 @@ def generate_dataset(output_dir, num_pairs, seed=42, archetype_weights=None, pre
             "id": pid,
             "source": {"image": "source/{}.png".format(pid), "platform": "android", "size": list(src_sz)},
             "target": {"image": "target/{}.png".format(pid), "platform": "ios" if not is_id else "android", "size": list(tgt_sz)},
-            "actions": actions, "archetype": archetype, "is_identity": is_id,
+            "actions": actions, "archetype": archetype, "is_identity": is_id, "pair_strategy": pair_strategy,
             "y_distribution": y_dist,
         })
         if (i + 1) % 500 == 0 or preview:
