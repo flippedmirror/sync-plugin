@@ -50,7 +50,7 @@ class TrainConfig:
 
     # Infra
     device: str = "cuda"
-    num_workers: int = 4
+    num_workers: int = 8
     output_dir: str = "checkpoints/cross_match"
     log_every: int = 50
     save_every_epoch: int = 5
