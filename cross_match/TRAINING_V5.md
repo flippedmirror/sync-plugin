@@ -216,26 +216,27 @@ L40S at ~$1.00-1.50/hr on-demand → **~$1.50 total**
 
 ## 6. Revised Plan — g5.2xlarge with NVMe
 
-### 6.1 Why g5.2xlarge
+### 6.1 Why g5.xlarge
 
 Previous runs used L40S on EBS storage. Two problems emerged:
 1. cuBLAS incompatibility on the L40S AMI (CUDA 13.0 + PyTorch 2.11)
 2. EBS I/O bottleneck for 10K+ cached feature files
 
-The g5.2xlarge solves both:
+The g5.xlarge solves both:
 - **A10G GPU**: Different CUDA stack, no cuBLAS issue expected (needs verification)
-- **450GB local NVMe SSD**: 100K+ IOPS, eliminates I/O bottleneck
-- **32GB RAM**: ~26GB page cache, partial cache fits. NVMe handles the rest.
-- **$1.21/hr**: Cheapest viable option
+- **250GB local NVMe SSD**: 100K+ IOPS, eliminates I/O bottleneck
+- **16GB RAM**: ~10GB page cache — small, but NVMe handles cache misses fine
+- **$1.00/hr**: Cheapest viable option
 
-| Spec | g5.2xlarge |
+| Spec | g5.xlarge |
 |---|---|
 | GPU | 1x NVIDIA A10G (24GB VRAM) |
-| RAM | 32GB |
-| Storage | 450GB local NVMe SSD |
-| vCPUs | 8 |
-| Cost | $1.21/hr |
+| RAM | 16GB |
+| Storage | 250GB local NVMe SSD |
+| vCPUs | 4 |
+| Cost | ~$1.00/hr |
 | A10G vs T4 | ~3x faster encoder, ~2x faster training |
+| Storage budget | 80GB cache + 5GB images + OS = ~86GB of 250GB |
 
 ### 6.2 Training Plan (Phase 1 Only)
 
@@ -249,10 +250,10 @@ Phase 2 (encoder fine-tuning) is deferred — adds ~10 hrs of training with unce
 | 1. Test run (100 pairs, 2 epochs) | Validate: deps install, CUDA works, caching works, training completes, no cuBLAS crash | ~5 min |
 | 2. Upload 20K data | SCP 4 × 1.2GB tarballs to instance | ~15 min |
 | 3. Cache features | DINOv2 encoder on 40K images, batch_size=16, save .pt files to NVMe | ~56 min |
-| 4. Train Phase 1 | 50 epochs, batch_size=64, frozen encoder, cosine LR 1e-4, warmup 5 epochs | ~6 min |
+| 4. Train Phase 1 | 50 epochs, batch_size=64, frozen encoder, cosine LR 1e-4, warmup 5 epochs | ~7 min |
 | 5. Download checkpoint | SCP best.pt (~127MB) locally | ~1 min |
-| **Total** | | **~83 min** |
-| **Cost** | ~1.4 hrs × $1.21/hr | **~$1.70** |
+| **Total** | | **~84 min** |
+| **Cost** | ~1.4 hrs × $1.00/hr | **~$1.40** |
 
 ### 6.3 Test Run Protocol (Step 1)
 
