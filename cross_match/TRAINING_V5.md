@@ -105,10 +105,119 @@ L40S at ~$1.00-1.50/hr on-demand → **~$1.50 total**
 
 **Key observation**: The model achieved good synthetic accuracy but learned to match by **position scaling** rather than visual content. On real device screenshots, accuracy was poor because the model couldn't find elements at positions different from the training distribution.
 
-### V5.1 Training (5K-15K v5.1 pairs, pairing strategies)
+### V5.1 Calibration Run (5K v5.1 pairs, 25 epochs, L40S)
 
-_Pending — training with new pairing strategy data (proportional 45% + independent 40% + shuffled 15% + identity 12%)._
+**Data**: 5K v5.1 batch 1 (with pairing strategies: proportional 45% + independent 40% + shuffled 15% + identity 12%)  
+**Instance**: L40S, 48GB VRAM, 30GB RAM, EBS gp3 storage  
+**Total training time**: ~13 min  
+**Feature caching**: 10K images at 20 img/s = ~8 min  
 
-### Full Run (15-20K pairs, 30+5 epochs)
+| Epoch | Train Loss | Val Loss | Mean px | Median px | p95 | @50px | @100px | Time |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.0673 | 0.0506 | 885 | 908 | 1460 | 0% | 0% | 96s |
+| 3 | 0.0132 | 0.0109 | 455 | 330 | 1454 | 3% | 8% | 29s |
+| 5 | 0.0114 | 0.0103 | 426 | 273 | 1455 | 6% | 18% | 30s |
+| 8 | 0.0109 | 0.0096 | 400 | 232 | 1381 | 7% | 21% | 29s |
+| 13 | 0.0099 | 0.0100 | 388 | 186 | 1384 | 9% | 30% | 28s |
+| **17** | **0.0090** | **0.0103** | **435** | **274** | **1307** | **7%** | **19%** | **29s** |
+| 25 | 0.0061 | 0.0113 | 406 | 185 | 1491 | 12% | 31% | 27s |
 
-_Pending._
+**Observations**:
+- v5.1 data is much harder than v5 — at epoch 25, mean distance is 406px (vs 29px for v5)
+- **Bimodal distribution**: Median (185px) much better than mean (406px). The proportional pairs are learned well, the independent-layout pairs produce outliers (p95 ~1400px)
+- **Val loss plateaued at epoch ~8** (0.0096) and started rising — overfitting on 5K training samples
+- Train loss keeps dropping while val loss rises — classic overfitting signal
+- 5K pairs with 40% independent strategy = only ~2K independent pairs — insufficient for the model to learn visual matching
+- **Conclusion**: Need more data (10K-20K) for the independent strategy to work. The model can't learn semantic matching from just ~2K independent pairs with 11M trainable params.
+
+---
+
+## 5. Infrastructure Issues & Learnings
+
+### 5.1 cuBLAS Compatibility (cublasLtCreate)
+
+**Error**: `Invalid handle. Cannot load symbol cublasLtCreate` on L40S with PyTorch 2.11 + CUDA 13.0 driver.
+
+**Impact**: DINOv2 encoder forward pass crashes at batch sizes > 16 when run through the training script's full model.forward() path. Does NOT affect:
+- Standalone `model._encode_image()` calls (caching works at batch_size=16)
+- Basic CUDA operations (matmul, linear layers)
+
+**Root cause**: Version mismatch between PyTorch-bundled cuBLAS and system CUDA 13.0 cuBLAS. The encoder uses operations (`torch.nn.functional.linear` in attention layers) that trigger `cublasLtCreate` which fails with the bundled library.
+
+**Workaround**: 
+- Feature caching at `--cache-batch-size 16` works (uses `torch.no_grad()` path)
+- No-cache training requires batch_size ≤ 16 (too slow for 20K data: ~600s/epoch)
+- `LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64` did NOT fix it
+
+### 5.2 Feature Cache I/O Bottleneck
+
+**The core scaling blocker for 10K+ pair training.**
+
+**Architecture**: Feature caching precomputes DINOv2 encoder outputs once, saves as individual `.pt` files (one per image, ~2MB each), then training loads them via DataLoader workers each epoch.
+
+**What works**:
+- 5K pairs = 10K `.pt` files, ~20GB total cache → **30s/epoch** ✅
+- OS page cache (20GB available on 30GB RAM instance) holds the entire 5K cache after epoch 1
+- All subsequent epochs read from RAM, not disk
+
+**What breaks**:
+- 10K pairs = 20K files, ~40GB cache → **epochs never complete** ❌
+- 20K pairs = 40K files, ~80GB cache → **same** ❌
+- Cache exceeds OS page cache → every epoch re-reads from EBS disk
+- EBS gp3: 3,000 IOPS baseline, 125 MB/s throughput
+- 20K random `torch.load()` calls per epoch: each involves file open + read + pickle deserialize + close
+- 4 DataLoader workers compete for I/O bandwidth + Python GIL during deserialization
+
+**Per-batch theoretical timing** (batch_size=64):
+
+| Step | Data size | Speed | Time |
+|---|---|---|---|
+| EBS → RAM (64 random .pt reads) | 128MB | 3,000 IOPS | ~21ms |
+| RAM → GPU (PCIe Gen4) | 128MB | 25 GB/s | ~5ms |
+| GPU compute (cross-attention fwd+bwd) | — | — | ~2-5ms |
+| **Total per batch** | | | **~28-31ms** |
+
+**Per-epoch theoretical** (10K pairs, 660 batches): 660 × 30ms = **~20s** — should work.
+
+**Why theory doesn't match reality**: `torch.load()` is much more expensive than raw file I/O:
+- Python pickle deserialization: ~0.2ms per file (adds ~4s/epoch for 20K files)
+- GIL contention: 4 workers all deserializing simultaneously serialize on the GIL
+- Memory allocation: each `torch.load()` allocates a new tensor (~0.1ms)
+- File handle overhead: open/close 20K files per epoch
+- OS page cache thrashing: 40GB cache, 20GB page cache → continuous eviction
+
+**Attempted fixes that didn't work**:
+- `num_workers=8` with `persistent_workers=True`: Caused DataLoader deadlock
+- `prefetch_factor=4`: No improvement on EBS random reads
+- No-cache mode: Hits cublasLtCreate bug at batch_size > 16
+
+### 5.3 Instance Constraints
+
+| Resource | Available | 5K needs | 10K needs | 20K needs |
+|---|---|---|---|---|
+| GPU VRAM | 48GB | ~3.5GB | ~3.5GB | ~3.5GB |
+| RAM | 30GB | 20GB cache fits in page cache | 40GB — doesn't fit | 80GB — way over |
+| EBS IOPS | 3,000 | Sufficient | Bottleneck | Severe bottleneck |
+| EBS throughput | 125 MB/s | OK | Marginal | Insufficient |
+
+### 5.4 Proposed Solutions
+
+| # | Approach | How it works | Effort | Instance requirement |
+|---|---|---|---|---|
+| **1** | **Memory-mapped numpy** | Save all features as 2 flat `.npy` files. Dataset reads via `numpy.memmap` — OS handles paging, zero pickle overhead, zero file open/close | Medium | Any (OS manages paging) |
+| 2 | Consolidated chunk files | Save features in ~100 chunk files of ~200 samples each. Reduces IOPS from 20K to ~100 per epoch | Medium | Any |
+| 3 | Preload into RAM | Load all .pt into a dict at startup. Zero disk I/O during training | Low | 96GB+ RAM |
+| 4 | Local NVMe instance | Use instance with local SSD (e.g., g5.xlarge). 100K+ IOPS, 1-7 GB/s | None | Different instance type |
+| 5 | Higher-throughput EBS | Provision io2 volume with 10K+ IOPS | None | ~$100/month storage cost |
+
+**Recommended**: Option 1 (memory-mapped numpy). Eliminates all Python-level I/O overhead. The OS memory-maps the files — reads that fit in page cache are served from RAM, others page from disk transparently. No pickle, no GIL contention, no per-file overhead. Works on any instance size.
+
+---
+
+## 6. Next Steps
+
+1. Implement memory-mapped numpy cache format (Option 1 from §5.4)
+2. Re-run 10K v5.1 training to validate fix
+3. Scale to 20K if I/O is resolved
+4. Target 50 epochs with 20K data for full convergence on semantic matching
+5. Export best checkpoint to ONNX and test on real device screenshots
