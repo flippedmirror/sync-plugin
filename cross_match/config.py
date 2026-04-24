@@ -5,10 +5,12 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     # Vision encoder
-    encoder_name: str = "dinov2_vits14"  # DINOv2-small via torch.hub
-    encoder_dim: int = 384               # DINOv2-small output dim
+    # Options: "dinov2_vits14" (DINOv2-small, 22M, 518px, 1369 tokens)
+    #          "siglip2_small" (SigLIP2-small, 22M, 256px, 256 tokens)
+    encoder_name: str = "dinov2_vits14"
+    encoder_dim: int = 384
     freeze_encoder: bool = True
-    image_size: int = 518               # DINOv2 native: 518 = 37 patches * 14
+    image_size: int = 518               # DINOv2: 518, SigLIP2: 256
 
     # Cross-attention transformer
     num_layers: int = 4

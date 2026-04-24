@@ -80,7 +80,7 @@ def _action_to_coords(action: dict, image_size: tuple[int, int]) -> tuple[list[f
 class CrossMatchDataset(Dataset):
     """Dataset that yields (source_image, source_coords, action_idx, target_image, target_coords)."""
 
-    def __init__(self, data_dir: str, image_size: int = 518, split: str = "train"):
+    def __init__(self, data_dir: str, image_size: int = 518, split: str = "train", encoder_name: str = None):
         self.data_dir = data_dir
         self.image_size = image_size
 
@@ -114,10 +114,15 @@ class CrossMatchDataset(Dataset):
                     "target_size": tgt_size,
                 })
 
+        # SigLIP uses mean=0.5, std=0.5; DINOv2/ImageNet uses standard normalization
+        if encoder_name and encoder_name.startswith("siglip"):
+            norm_mean, norm_std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+        else:
+            norm_mean, norm_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
         self.transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=norm_mean, std=norm_std),
         ])
 
     def __len__(self):

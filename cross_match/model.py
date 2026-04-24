@@ -1,4 +1,8 @@
-"""CrossMatch model: frozen DINOv2 encoder + cross-attention transformer + coordinate/action heads.
+"""CrossMatch model: frozen vision encoder + cross-attention transformer + coordinate/action heads.
+
+Supported encoders:
+  - DINOv2-small (22M params, 518px input, 1369 patch tokens, 384 dim)
+  - SigLIP2-small (22M params, 256px input, 256 patch tokens, 384 dim)
 
 Input:
   - source_image: screenshot from device A
@@ -110,15 +114,35 @@ class CrossMatchModel(nn.Module):
             config = ModelConfig()
         self.config = config
 
-        # Frozen DINOv2 vision encoder (via timm for Python 3.9 compat)
-        try:
-            self.encoder = torch.hub.load("facebookresearch/dinov2", config.encoder_name)
-        except TypeError:
-            # Fallback: load DINOv2 via HuggingFace transformers
-            from transformers import Dinov2Model
-            hf_name = "facebook/dinov2-small" if "vits" in config.encoder_name else "facebook/dinov2-base"
-            self.encoder = Dinov2Model.from_pretrained(hf_name)
-            self._hf_encoder = True
+        # Vision encoder
+        self._encoder_type = "dinov2"
+        if config.encoder_name.startswith("siglip"):
+            from transformers import SiglipVisionModel
+            hf_name = {
+                "siglip2_small": "google/siglip2-so400m-patch14-384",  # will use small config
+            }.get(config.encoder_name)
+            # For siglip2_small, we use the base-patch16-256 variant
+            if config.encoder_name == "siglip2_small":
+                hf_name = "google/siglip-base-patch16-256"
+                # Try siglip2 first, fall back to siglip
+                try:
+                    from transformers import Siglip2VisionModel
+                    self.encoder = Siglip2VisionModel.from_pretrained(hf_name)
+                except (ImportError, OSError):
+                    self.encoder = SiglipVisionModel.from_pretrained(hf_name)
+            else:
+                self.encoder = SiglipVisionModel.from_pretrained(hf_name)
+            self._encoder_type = "siglip"
+        elif config.encoder_name.startswith("dinov2"):
+            try:
+                self.encoder = torch.hub.load("facebookresearch/dinov2", config.encoder_name)
+            except TypeError:
+                from transformers import Dinov2Model
+                hf_name = "facebook/dinov2-small" if "vits" in config.encoder_name else "facebook/dinov2-base"
+                self.encoder = Dinov2Model.from_pretrained(hf_name)
+                self._encoder_type = "dinov2_hf"
+        else:
+            raise ValueError(f"Unknown encoder: {config.encoder_name}")
 
         if config.freeze_encoder:
             for param in self.encoder.parameters():
@@ -174,7 +198,7 @@ class CrossMatchModel(nn.Module):
         self.action_head = nn.Linear(config.hidden_dim, config.num_actions)
 
     def _encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """Run frozen DINOv2 encoder. Returns patch features.
+        """Run frozen vision encoder. Returns patch features.
 
         Args:
             image: (B, 3, H, W) normalized image
@@ -183,7 +207,11 @@ class CrossMatchModel(nn.Module):
         """
         ctx = torch.no_grad() if self.config.freeze_encoder else nullcontext()
         with ctx:
-            if getattr(self, "_hf_encoder", False):
+            if self._encoder_type == "siglip":
+                # SigLIP / SigLIP2: last_hidden_state is all patch tokens (no CLS)
+                outputs = self.encoder(image)
+                patch_tokens = outputs.last_hidden_state
+            elif self._encoder_type == "dinov2_hf":
                 # HuggingFace Dinov2Model
                 outputs = self.encoder(image)
                 patch_tokens = outputs.last_hidden_state[:, 1:]  # skip CLS token

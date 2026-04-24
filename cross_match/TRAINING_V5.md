@@ -130,6 +130,40 @@ L40S at ~$1.00-1.50/hr on-demand → **~$1.50 total**
 - 5K pairs with 40% independent strategy = only ~2K independent pairs — insufficient for the model to learn visual matching
 - **Conclusion**: Need more data (10K-20K) for the independent strategy to work. The model can't learn semantic matching from just ~2K independent pairs with 11M trainable params.
 
+### V5.1 Full Run (20K v5.1 pairs, 33/50 epochs, g5.xlarge A10G)
+
+**Data**: 20K v5.1 pairs (4 × 5K batches merged)  
+**Instance**: g5.xlarge (A10G 24GB VRAM, 16GB RAM, 250GB NVMe SSD)  
+**Caching**: 40K images at 16 img/s = ~40 min (no cuBLAS issues on A10G)  
+**Epoch time**: ~565s (~9.4 min)  
+**Training stopped at epoch 33** — val loss rising, clear overfitting.
+
+| Epoch | Train Loss | Val Loss | Mean px | Median px | p95 | @10px | @20px | @50px | @100px |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 0.0415 | 0.0268 | 832 | 798 | 1527 | 0% | 0% | 0% | 1% |
+| 2 | 0.0143 | 0.0115 | 417 | 231 | 1601 | 0% | 2% | 8% | 22% |
+| 5 | 0.0110 | 0.0113 | 422 | 223 | 1551 | 0% | 2% | 9% | 25% |
+| 10 | 0.0106 | 0.0109 | 395 | 164 | 1525 | 1% | 2% | 13% | 37% |
+| **15** | **0.0098** | **0.0107** | **397** | **181** | **1471** | **1%** | **2%** | **11%** | **31%** |
+| 20 | 0.0085 | 0.0116 | 401 | 170 | 1606 | 1% | 3% | 15% | 35% |
+| 25 | 0.0065 | 0.0118 | 392 | 157 | 1647 | 1% | 3% | 16% | 38% |
+| **30** | **0.0044** | **0.0127** | **395** | **134** | **1730** | **1%** | **5%** | **21%** | **42%** |
+| 33 | 0.0035 | 0.0133 | 416 | 153 | 1735 | 1% | 4% | 16% | 37% |
+
+**Key findings**:
+
+1. **Bimodal performance**: Proportional pairs getting very accurate (median dropping 798→134px), independent-layout pairs getting worse (p95 rising 1527→1735px). The model learned position scaling but not visual matching.
+
+2. **Overfitting confirmed**: Train loss dropped 12x (0.0415→0.0035) while val loss rose 25% (0.0107→0.0133). The model memorizes training examples without generalizing.
+
+3. **Best checkpoint**: Epoch 15 (best val loss 0.0107) or epoch 30 (best @100px 42%, best median 134px, but worse val loss). Saved: `best.pt` (epoch 15), `epoch_10.pt`, `epoch_30.pt`.
+
+4. **20K data not sufficient**: Scaling from 5K to 20K improved proportional pair accuracy but didn't help independent-layout pairs. The frozen DINOv2 encoder is the bottleneck — its features aren't discriminative enough for semantic UI element matching.
+
+5. **DINOv2 limitation**: Trained on natural images (ImageNet), DINOv2 captures shapes and textures but can't semantically distinguish between similar UI elements (e.g., Chrome icon vs Safari icon) or read text labels. The cross-attention head can't compensate for this feature-level limitation.
+
+**Decision**: Switch encoder from DINOv2-small to SigLIP2-small for V6. SigLIP2 is trained on image-text pairs and understands visual-semantic relationships, which should produce more discriminative features for UI element matching. Same param count (22M encoder, 384 hidden dim) — drop-in replacement.
+
 ---
 
 ## 5. Infrastructure Issues & Learnings

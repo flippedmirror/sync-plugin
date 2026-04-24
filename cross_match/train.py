@@ -47,10 +47,14 @@ def cache_features(model: CrossMatchModel, dataset: CrossMatchDataset, cache_dir
     os.makedirs(os.path.join(cache_dir, "target"), exist_ok=True)
 
     model.eval()
+    if model.config.encoder_name.startswith("siglip"):
+        norm_mean, norm_std = [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+    else:
+        norm_mean, norm_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
     transform = transforms.Compose([
         transforms.Resize((model.config.image_size, model.config.image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=norm_mean, std=norm_std),
     ])
 
     # Collect unique image paths that need caching
@@ -238,7 +242,11 @@ def main(args):
     )
     if args.finetune_lr:
         config.finetune_lr = args.finetune_lr
-    model_config = ModelConfig()
+    encoder_name = args.encoder
+    if encoder_name == "siglip2_small":
+        model_config = ModelConfig(encoder_name="siglip2_small", image_size=256)
+    else:
+        model_config = ModelConfig(encoder_name=encoder_name)
     os.makedirs(config.output_dir, exist_ok=True)
     device = config.device
     progress_path = os.path.join(config.output_dir, "progress.json")
@@ -262,7 +270,7 @@ def main(args):
     total_params = sum(p.numel() for p in model.parameters())
     print("  Total params: {:.1f}M | Trainable: {:.1f}M".format(total_params / 1e6, trainable / 1e6))
 
-    raw_dataset = CrossMatchDataset(config.data_dir, model_config.image_size)
+    raw_dataset = CrossMatchDataset(config.data_dir, model_config.image_size, encoder_name=model_config.encoder_name)
     print("  Total samples (actions): {}".format(len(raw_dataset)))
 
     use_cached = config.cache_features
@@ -407,5 +415,6 @@ if __name__ == "__main__":
     parser.add_argument("--cache-batch-size", type=int, default=16, help="Batch size for feature caching (16 safest for CUDA compat)")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision training (fp16)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--encoder", type=str, default="dinov2_vits14", choices=["dinov2_vits14", "siglip2_small"], help="Vision encoder")
     args = parser.parse_args()
     main(args)
