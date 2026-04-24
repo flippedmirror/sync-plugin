@@ -210,14 +210,114 @@ L40S at ~$1.00-1.50/hr on-demand → **~$1.50 total**
 | 4 | Local NVMe instance | Use instance with local SSD (e.g., g5.xlarge). 100K+ IOPS, 1-7 GB/s | None | Different instance type |
 | 5 | Higher-throughput EBS | Provision io2 volume with 10K+ IOPS | None | ~$100/month storage cost |
 
-**Recommended**: Option 1 (memory-mapped numpy). Eliminates all Python-level I/O overhead. The OS memory-maps the files — reads that fit in page cache are served from RAM, others page from disk transparently. No pickle, no GIL contention, no per-file overhead. Works on any instance size.
+**Resolution**: Use an instance with local NVMe SSD (Option 4). The EBS I/O bottleneck is a storage problem, not a code problem. Local NVMe provides 100K+ IOPS and 1-7 GB/s — eliminates the bottleneck without any code changes.
 
 ---
 
-## 6. Next Steps
+## 6. Revised Plan — g5.2xlarge with NVMe
 
-1. Implement memory-mapped numpy cache format (Option 1 from §5.4)
-2. Re-run 10K v5.1 training to validate fix
-3. Scale to 20K if I/O is resolved
-4. Target 50 epochs with 20K data for full convergence on semantic matching
-5. Export best checkpoint to ONNX and test on real device screenshots
+### 6.1 Why g5.2xlarge
+
+Previous runs used L40S on EBS storage. Two problems emerged:
+1. cuBLAS incompatibility on the L40S AMI (CUDA 13.0 + PyTorch 2.11)
+2. EBS I/O bottleneck for 10K+ cached feature files
+
+The g5.2xlarge solves both:
+- **A10G GPU**: Different CUDA stack, no cuBLAS issue expected (needs verification)
+- **450GB local NVMe SSD**: 100K+ IOPS, eliminates I/O bottleneck
+- **32GB RAM**: ~26GB page cache, partial cache fits. NVMe handles the rest.
+- **$1.21/hr**: Cheapest viable option
+
+| Spec | g5.2xlarge |
+|---|---|
+| GPU | 1x NVIDIA A10G (24GB VRAM) |
+| RAM | 32GB |
+| Storage | 450GB local NVMe SSD |
+| vCPUs | 8 |
+| Cost | $1.21/hr |
+| A10G vs T4 | ~3x faster encoder, ~2x faster training |
+
+### 6.2 Training Plan (Phase 1 Only)
+
+Phase 2 (encoder fine-tuning) is deferred — adds ~10 hrs of training with uncertain benefit. Will reconsider after Phase 1 results.
+
+**Data**: 20K v5.1 pairs (4 batches × 5K, all generated locally)  
+**Strategy mix**: Proportional 45% + Independent 40% + Shuffled 15% + Identity 12%
+
+| Step | What | Expected time |
+|---|---|---|
+| 1. Test run (100 pairs, 2 epochs) | Validate: deps install, CUDA works, caching works, training completes, no cuBLAS crash | ~5 min |
+| 2. Upload 20K data | SCP 4 × 1.2GB tarballs to instance | ~15 min |
+| 3. Cache features | DINOv2 encoder on 40K images, batch_size=16, save .pt files to NVMe | ~56 min |
+| 4. Train Phase 1 | 50 epochs, batch_size=64, frozen encoder, cosine LR 1e-4, warmup 5 epochs | ~6 min |
+| 5. Download checkpoint | SCP best.pt (~127MB) locally | ~1 min |
+| **Total** | | **~83 min** |
+| **Cost** | ~1.4 hrs × $1.21/hr | **~$1.70** |
+
+### 6.3 Test Run Protocol (Step 1)
+
+Before committing to the full run, validate the entire pipeline with minimal data:
+
+```bash
+# 1. Install deps
+pip3 install torch torchvision pillow
+
+# 2. Verify CUDA
+python3 -c 'import torch; print(torch.cuda.get_device_name(0))'
+
+# 3. Clone repo
+git clone https://github.com/flippedmirror/sync-plugin.git
+
+# 4. Generate 100 test pairs
+python3 -u -m cross_match.synthetic_v5 --output-dir data/test_100 --num-pairs 100 --seed 99
+
+# 5. Run 2-epoch training with caching
+python3 -u -m cross_match.train \
+  --data-dir data/test_100 \
+  --output-dir checkpoints/test \
+  --epochs 2 --finetune-epochs 0 \
+  --batch-size 16 --lr 1e-4 --warmup-epochs 1 \
+  --cache-batch-size 16 \
+  --device cuda
+```
+
+**Pass criteria**: Both epochs complete, progress.json shows "complete", GPU utilization > 0% during training, no cublasLtCreate errors.
+
+**If test fails**: Debug on the test instance before uploading 20K data. Do not proceed until test passes.
+
+### 6.4 Accuracy Targets
+
+| Metric | v5 (5K, proportional only) | v5.1 target (20K, mixed strategies) |
+|---|---|---|
+| Mean pixel distance | 29px | <100px |
+| @50px | 91% | >40% |
+| @100px | 100% | >70% |
+| Independent pair @100px | N/A | >50% |
+| Identity pair mean | N/A | <10px |
+
+Note: Targets are conservative. v5.1's independent layout pairs make this a fundamentally harder task than v5. The model must learn visual matching, not position scaling. Lower absolute numbers are expected.
+
+### 6.5 Decision Points
+
+After Phase 1 completes:
+
+1. **If @100px > 70%**: Export to ONNX, test on real device screenshots. Consider Phase 2 only if real-world accuracy needs improvement.
+2. **If @100px 40-70%**: Run 50 more epochs from checkpoint (same data). If still plateaued, consider more data or architecture changes.
+3. **If @100px < 40%**: The frozen DINOv2 features may be insufficient for semantic matching. Consider Phase 2 on a faster GPU (L40S with compatible CUDA), or switch to a different encoder.
+
+---
+
+## 7. Checkpoints & Data Inventory (Local)
+
+| Item | Path | Size |
+|---|---|---|
+| v5 checkpoint (5K, 25ep) | `checkpoints/v5_5k_25ep/best_25ep.pt` | 127MB |
+| v5 ONNX model | `plugin/models/cross_match_v5.onnx` | 128MB |
+| v5.1 checkpoint (5K, 25ep) | `checkpoints/v5.1_5k/best.pt` | 127MB |
+| v5.1 batch 1 data (seed=500) | `data/cross_match_v5.1_batch1/` | 1.3GB |
+| v5.1 batch 2 data (seed=600) | `data/cross_match_v5.1_batch2/` | 1.3GB |
+| v5.1 batch 3 data (seed=700) | `data/cross_match_v5.1_batch3/` | 1.3GB |
+| v5.1 batch 4 data (seed=800) | `data/cross_match_v5.1_batch4/` | 1.3GB |
+| v5.1 batch tarballs | `data/cross_match_v5.1_batch{1-4}.tar.gz` | 4 × 1.2GB |
+| Original v5 data (5K) | `data/cross_match_v5_5k/` | 1.3GB |
+| Original v2 ONNX model | `plugin/models/cross_match.onnx` | 128MB |
